@@ -42,7 +42,21 @@ python3 docker_hub_env_finder.py fastapi --result-dir result
 Пример с параллельной обработкой:
 
 ```bash
-python3 docker_hub_env_finder.py fastapi --max-results 20 --workers 4
+python3 docker_hub_env_finder.py trading_bot --max-results 150 --workers 4 --start-from-index 100
+```
+
+Пример продолжения с 230-й позиции:
+
+```bash
+python3 docker_hub_env_finder.py fastapi --start-from-index 230
+```
+
+Скрипт вычисляет стартовую страницу как `230 / page_size` и начинает поиск сразу с неё, а не с первой страницы.
+
+Пример продолжения с конкретного образа:
+
+```bash
+python3 docker_hub_env_finder.py fastapi --start-from-image owner/repo
 ```
 
 Если в Python-окружении есть проблемы с TLS-сертификатами:
@@ -60,6 +74,8 @@ python3 docker_hub_env_finder.py fastapi --insecure
 - `--max-pages` — максимум страниц поиска, чтобы не обходить слишком много результатов.
 - `--start-timeout` — сколько ждать после старта контейнера перед остановкой.
 - `--keep-temp` — не удалять временные директории.
+- `--start-from-image` — начать сканирование с указанного `owner/repo`.
+- `--start-from-index` — начать сканирование с указанной позиции; стартовая страница вычисляется автоматически.
 - `--workers` — количество параллельных проверок.
 - `--report-file` — сохранить отчёт в `.json` или `.csv`.
 - `--result-dir` — папка, куда копируются найденные `.env`.

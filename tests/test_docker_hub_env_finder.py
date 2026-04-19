@@ -7,6 +7,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from docker_hub_env_finder import (
+    _IMAGE_USAGE_COUNTS,
+    calculate_page_offset,
+    calculate_start_page,
     choose_pullable_image_reference,
     classify_pull_error,
     RepositoryCandidate,
@@ -22,6 +25,7 @@ from docker_hub_env_finder import (
     scan_repository,
     scan_repositories,
     search_repositories,
+    slice_candidates,
 )
 
 
@@ -72,6 +76,34 @@ class ResultFileTests(unittest.TestCase):
 
 
 class SearchRepositoriesTests(unittest.TestCase):
+    def test_calculate_start_page(self) -> None:
+        self.assertEqual(calculate_start_page(230, 100), 3)
+
+    def test_calculate_page_offset(self) -> None:
+        self.assertEqual(calculate_page_offset(230, 100), 29)
+
+    def test_slice_candidates_starts_from_index(self) -> None:
+        candidates = [
+            RepositoryCandidate("one", "alice", "image", 1, ""),
+            RepositoryCandidate("two", "alice", "image", 1, ""),
+            RepositoryCandidate("three", "alice", "image", 1, ""),
+        ]
+
+        sliced = slice_candidates(candidates, start_from_index=2)
+
+        self.assertEqual([item.image for item in sliced], ["alice/two", "alice/three"])
+
+    def test_slice_candidates_starts_from_image(self) -> None:
+        candidates = [
+            RepositoryCandidate("one", "alice", "image", 1, ""),
+            RepositoryCandidate("two", "alice", "image", 1, ""),
+            RepositoryCandidate("three", "alice", "image", 1, ""),
+        ]
+
+        sliced = slice_candidates(candidates, start_from_image="alice/two")
+
+        self.assertEqual([item.image for item in sliced], ["alice/two", "alice/three"])
+
     @patch("docker_hub_env_finder.fetch_tags_page")
     def test_get_image_references_uses_latest_tags(self, fetch_tags_page) -> None:
         fetch_tags_page.return_value = {
@@ -171,6 +203,21 @@ class SearchRepositoriesTests(unittest.TestCase):
                 ),
             ],
         )
+
+    @patch("docker_hub_env_finder.fetch_search_page")
+    def test_search_repositories_starts_from_requested_page(self, fetch_search_page) -> None:
+        fetch_search_page.return_value = {"next": "", "results": []}
+
+        search_repositories(
+            query="app",
+            max_pulls=500,
+            max_results=2,
+            page_size=100,
+            max_pages=5,
+            start_page=3,
+        )
+
+        self.assertEqual(fetch_search_page.call_args.kwargs["page"], 3)
 
     @patch("docker_hub_env_finder.fetch_search_page")
     def test_stops_when_docker_hub_reports_no_next_page(self, fetch_search_page) -> None:
@@ -300,6 +347,7 @@ class ScanRepositoryTests(unittest.TestCase):
         choose_pullable_image_reference_mock.return_value = ("jjjohny228/1win4games:32.0.0", None, None)
         run_command_mock.side_effect = [
             type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
+            type("CP", (), {"returncode": 0, "stderr": "", "stdout": "sha256:abc123\n"})(),
             type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
             type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
         ]
@@ -315,15 +363,29 @@ class ScanRepositoryTests(unittest.TestCase):
 
         self.assertEqual(result.image, "jjjohny228/1win4games:32.0.0")
         self.assertEqual(run_command_mock.call_args_list[0].args[0], ["docker", "create", "--name", unittest.mock.ANY, "jjjohny228/1win4games:32.0.0"])
-        cleanup_image_mock.assert_called_once_with("jjjohny228/1win4games:32.0.0")
+        self.assertEqual(run_command_mock.call_args_list[1].args[0], ["docker", "inspect", "-f", "{{.Image}}", unittest.mock.ANY])
+        cleanup_image_mock.assert_called_once_with("sha256:abc123")
 
 
 class CleanupTests(unittest.TestCase):
-    @patch("docker_hub_env_finder.run_command")
-    def test_cleanup_image_uses_exact_image_reference(self, run_command_mock) -> None:
-        cleanup_image("alice/project")
+    def setUp(self) -> None:
+        _IMAGE_USAGE_COUNTS.clear()
 
-        run_command_mock.assert_called_once_with(["docker", "image", "rm", "-f", "alice/project"], check=False)
+    @patch("docker_hub_env_finder.run_command")
+    def test_cleanup_image_uses_exact_image_id(self, run_command_mock) -> None:
+        cleanup_image("sha256:deadbeef")
+
+        run_command_mock.assert_called_once_with(["docker", "image", "rm", "-f", "sha256:deadbeef"], check=False)
+
+    @patch("docker_hub_env_finder.run_command")
+    def test_cleanup_image_waits_for_last_user(self, run_command_mock) -> None:
+        _IMAGE_USAGE_COUNTS["sha256:shared"] = 2
+
+        cleanup_image("sha256:shared")
+        cleanup_image("sha256:shared")
+
+        self.assertEqual(run_command_mock.call_count, 1)
+        run_command_mock.assert_called_once_with(["docker", "image", "rm", "-f", "sha256:shared"], check=False)
 
 
 if __name__ == "__main__":

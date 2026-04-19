@@ -7,6 +7,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +20,8 @@ from urllib.error import HTTPError, URLError
 
 DOCKER_HUB_SEARCH_URL = "https://hub.docker.com/v2/search/repositories/"
 DOCKER_HUB_TAGS_URL = "https://hub.docker.com/v2/namespaces/{namespace}/repositories/{name}/tags"
+_IMAGE_USAGE_LOCK = threading.Lock()
+_IMAGE_USAGE_COUNTS: dict[str, int] = {}
 
 
 @dataclass(slots=True)
@@ -112,6 +115,16 @@ def parse_args() -> argparse.Namespace:
         help="Keep temporary directories with copied /app content.",
     )
     parser.add_argument(
+        "--start-from-image",
+        help="Start scanning from this repository image name, for example owner/repo.",
+    )
+    parser.add_argument(
+        "--start-from-index",
+        type=int,
+        default=1,
+        help="Start scanning from this 1-based position in the found repository list. Default: 1.",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=1,
@@ -145,8 +158,7 @@ def fetch_search_page(query: str, page: int, page_size: int, insecure: bool = Fa
             "query": query,
             "page": page,
             "page_size": page_size,
-            "sort": "updated_at",
-            "order": "desc",
+            "ordering": "-last_updated",
         }
     )
     req = request.Request(
@@ -194,13 +206,15 @@ def search_repositories(
     max_results: int,
     page_size: int,
     max_pages: int,
+    start_page: int = 1,
     insecure: bool = False,
 ) -> list[RepositoryCandidate]:
     results: list[RepositoryCandidate] = []
-    page = 1
+    page = max(start_page, 1)
     has_next_page = True
+    pages_checked = 0
 
-    while len(results) < max_results and has_next_page and page <= max_pages:
+    while len(results) < max_results and has_next_page and pages_checked < max_pages:
         payload = fetch_search_page(query=query, page=page, page_size=page_size, insecure=insecure)
         raw_items = payload.get("results", [])
         if not raw_items:
@@ -230,8 +244,37 @@ def search_repositories(
 
         has_next_page = bool(payload.get("next"))
         page += 1
+        pages_checked += 1
 
     return results
+
+
+def slice_candidates(
+    candidates: list[RepositoryCandidate],
+    start_from_index: int = 1,
+    start_from_image: str | None = None,
+) -> list[RepositoryCandidate]:
+    start_index = max(start_from_index, 1) - 1
+    sliced = candidates[start_index:]
+
+    if not start_from_image:
+        return sliced
+
+    for index, candidate in enumerate(sliced):
+        if candidate.image == start_from_image:
+            return sliced[index:]
+
+    return []
+
+
+def calculate_start_page(start_from_index: int, page_size: int) -> int:
+    normalized_index = max(start_from_index, 1)
+    return ((normalized_index - 1) // page_size) + 1
+
+
+def calculate_page_offset(start_from_index: int, page_size: int) -> int:
+    normalized_index = max(start_from_index, 1)
+    return (normalized_index - 1) % page_size
 
 
 def run_command(args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -275,11 +318,37 @@ def contains_env_file(directory: Path) -> bool:
 
 
 def cleanup_container(container_name: str) -> None:
-    run_command(["docker", "rm", "-f", container_name], check=False)
+    run_command(["docker", "rm", "-f", "-v", container_name], check=False)
 
 
-def cleanup_image(image: str) -> None:
-    run_command(["docker", "image", "rm", "-f", image], check=False)
+def inspect_container_image_id(container_name: str) -> str | None:
+    result = run_command(["docker", "inspect", "-f", "{{.Image}}", container_name], check=False)
+    if result.returncode != 0:
+        return None
+
+    image_id = result.stdout.strip()
+    return image_id or None
+
+
+def register_image_usage(image_id: str) -> None:
+    with _IMAGE_USAGE_LOCK:
+        _IMAGE_USAGE_COUNTS[image_id] = _IMAGE_USAGE_COUNTS.get(image_id, 0) + 1
+
+
+def cleanup_image(image_id: str) -> None:
+    should_remove = False
+    with _IMAGE_USAGE_LOCK:
+        usage_count = _IMAGE_USAGE_COUNTS.get(image_id)
+        if usage_count is None:
+            should_remove = True
+        elif usage_count <= 1:
+            _IMAGE_USAGE_COUNTS.pop(image_id, None)
+            should_remove = True
+        else:
+            _IMAGE_USAGE_COUNTS[image_id] = usage_count - 1
+
+    if should_remove:
+        run_command(["docker", "image", "rm", "-f", image_id], check=False)
 
 
 def classify_pull_error(error: str) -> str:
@@ -322,6 +391,7 @@ def scan_repository(
     container_name = f"find-docker-env-{uuid.uuid4().hex[:12]}"
     temp_dir_path = Path(tempfile.mkdtemp(prefix=f"find-docker-env-{make_safe_image_name(candidate.image)}-"))
     resolved_image: str | None = None
+    resolved_image_id: str | None = None
 
     try:
         try:
@@ -361,6 +431,10 @@ def scan_repository(
                 error=error,
             )
 
+        resolved_image_id = inspect_container_image_id(container_name)
+        if resolved_image_id:
+            register_image_usage(resolved_image_id)
+
         start_result = run_command(["docker", "start", container_name], check=False)
         if start_result.returncode != 0:
             error = start_result.stderr.strip() or start_result.stdout.strip() or "docker start failed"
@@ -395,8 +469,8 @@ def scan_repository(
         )
     finally:
         cleanup_container(container_name)
-        if resolved_image:
-            cleanup_image(resolved_image)
+        if resolved_image_id:
+            cleanup_image(resolved_image_id)
         if not keep_temp:
             shutil.rmtree(temp_dir_path, ignore_errors=True)
 
@@ -512,13 +586,21 @@ def main() -> int:
 
     try:
         ensure_docker_available()
+        start_page = calculate_start_page(args.start_from_index, args.page_size)
+        page_offset = calculate_page_offset(args.start_from_index, args.page_size)
         candidates = search_repositories(
             query=args.query,
             max_pulls=args.max_pulls,
             max_results=args.max_results,
             page_size=args.page_size,
             max_pages=args.max_pages,
+            start_page=start_page,
             insecure=args.insecure,
+        )
+        candidates = slice_candidates(
+            candidates,
+            start_from_index=page_offset + 1,
+            start_from_image=args.start_from_image,
         )
     except ssl.SSLCertVerificationError as exc:
         print(
