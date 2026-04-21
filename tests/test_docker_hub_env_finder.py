@@ -12,6 +12,7 @@ from docker_hub_env_finder import (
     calculate_start_page,
     choose_pullable_image_reference,
     classify_pull_error,
+    copy_found_files,
     RepositoryCandidate,
     ScanResult,
     cleanup_image,
@@ -19,6 +20,7 @@ from docker_hub_env_finder import (
     copy_found_env,
     extract_image_parts,
     find_env_file,
+    find_sensitive_files,
     get_image_references,
     make_safe_image_name,
     save_report,
@@ -39,6 +41,21 @@ class ContainsEnvFileTests(unittest.TestCase):
 
             self.assertTrue(contains_env_file(root))
             self.assertEqual(find_env_file(root), nested / ".env")
+
+    def test_detects_multiple_sensitive_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            app_dir = root / "app"
+            app_dir.mkdir(parents=True)
+            (app_dir / ".env.production").write_text("SECRET=1", encoding="utf-8")
+            (app_dir / "config.json").write_text('{"token":"1"}', encoding="utf-8")
+
+            matches = find_sensitive_files(root)
+
+            self.assertEqual(
+                [path.name for path in matches],
+                [".env.production", "config.json"],
+            )
 
     def test_returns_false_when_env_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -62,8 +79,29 @@ class ResultFileTests(unittest.TestCase):
 
             saved = copy_found_env(source, root / "result", "alice/project:latest")
 
-            self.assertEqual(saved.name, "alice_project_latest.env")
+            self.assertEqual(saved, root / "result" / "alice_project_latest" / ".env")
             self.assertEqual(saved.read_text(encoding="utf-8"), "KEY=VALUE")
+
+    def test_copy_found_files_preserves_relative_paths_under_image_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            scan_root = root / "scan"
+            config_dir = scan_root / "app" / "config"
+            config_dir.mkdir(parents=True)
+            first = config_dir / ".env.local"
+            second = scan_root / "settings.py"
+            first.write_text("KEY=VALUE", encoding="utf-8")
+            second.write_text("DEBUG=False", encoding="utf-8")
+
+            saved = copy_found_files([first, second], scan_root, root / "result", "alice/project:latest")
+
+            self.assertEqual(
+                saved,
+                [
+                    root / "result" / "alice_project_latest" / "app" / "config" / ".env.local",
+                    root / "result" / "alice_project_latest" / "settings.py",
+                ],
+            )
 
     def test_classify_pull_error_for_legacy_manifest(self) -> None:
         error = (
@@ -281,6 +319,7 @@ class SaveReportTests(unittest.TestCase):
             with report_path.open(encoding="utf-8", newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]["status"], "ok")
+            self.assertEqual(rows[0]["matched_files"], "[]")
 
 
 class ScanRepositoriesTests(unittest.TestCase):

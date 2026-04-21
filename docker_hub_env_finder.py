@@ -22,6 +22,15 @@ DOCKER_HUB_SEARCH_URL = "https://hub.docker.com/v2/search/repositories/"
 DOCKER_HUB_TAGS_URL = "https://hub.docker.com/v2/namespaces/{namespace}/repositories/{name}/tags"
 _IMAGE_USAGE_LOCK = threading.Lock()
 _IMAGE_USAGE_COUNTS: dict[str, int] = {}
+SENSITIVE_FILE_NAMES = {
+    "config.json",
+    "settings.py",
+    "application.yml",
+    "application.yaml",
+    "config.yaml",
+    "secrets.json",
+    "credentials.json",
+}
 
 
 @dataclass(slots=True)
@@ -47,6 +56,8 @@ class ScanResult:
     status: str
     env_source: Path | None = None
     env_saved_to: Path | None = None
+    matched_files: list[Path] | None = None
+    saved_files: list[Path] | None = None
     error: str | None = None
 
 
@@ -307,14 +318,26 @@ def copy_container_filesystem(container_name: str, destination_root: Path) -> tu
         return False, None, stderr or "failed to copy container filesystem"
 
 
+def is_sensitive_file(path: Path) -> bool:
+    name = path.name.lower()
+    return name.startswith(".env") or name in SENSITIVE_FILE_NAMES
+
+
 def find_env_file(directory: Path) -> Path | None:
-    for path in directory.rglob(".env"):
-        return path
-    return None
+    matches = find_sensitive_files(directory)
+    return matches[0] if matches else None
+
+
+def find_sensitive_files(directory: Path) -> list[Path]:
+    matches: list[Path] = []
+    for path in directory.rglob("*"):
+        if path.is_file() and is_sensitive_file(path):
+            matches.append(path)
+    return sorted(matches)
 
 
 def contains_env_file(directory: Path) -> bool:
-    return find_env_file(directory) is not None
+    return bool(find_sensitive_files(directory))
 
 
 def cleanup_container(container_name: str) -> None:
@@ -375,10 +398,30 @@ def choose_pullable_image_reference(candidate: RepositoryCandidate, insecure: bo
 
 def copy_found_env(env_path: Path, result_dir: Path, image: str) -> Path:
     result_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = make_safe_image_name(image)
-    destination = result_dir / f"{safe_name}.env"
+    image_dir = result_dir / make_safe_image_name(image)
+    image_dir.mkdir(parents=True, exist_ok=True)
+    destination = image_dir / env_path.name
     shutil.copy2(env_path, destination)
     return destination
+
+
+def copy_found_files(found_paths: list[Path], root_dir: Path, result_dir: Path, image: str) -> list[Path]:
+    result_dir.mkdir(parents=True, exist_ok=True)
+    image_dir = result_dir / make_safe_image_name(image)
+    image_dir.mkdir(parents=True, exist_ok=True)
+    saved_paths: list[Path] = []
+
+    for path in found_paths:
+        try:
+            relative_path = path.relative_to(root_dir)
+        except ValueError:
+            relative_path = Path(path.name)
+        destination = image_dir / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
+        saved_paths.append(destination)
+
+    return saved_paths
 
 
 def scan_repository(
@@ -452,9 +495,15 @@ def scan_repository(
         run_command(["docker", "stop", "-t", "5", container_name], check=False)
 
         files_copied, copied_root, copy_error = copy_container_filesystem(container_name, temp_dir_path)
-        env_path = find_env_file(copied_root) if files_copied and copied_root is not None else None
+        matched_files = find_sensitive_files(copied_root) if files_copied and copied_root is not None else []
+        env_path = matched_files[0] if matched_files else None
         env_found = env_path is not None
-        env_saved_to = copy_found_env(env_path, result_dir, resolved_image) if env_path and resolved_image else None
+        saved_files = (
+            copy_found_files(matched_files, copied_root, result_dir, resolved_image)
+            if matched_files and copied_root is not None and resolved_image
+            else []
+        )
+        env_saved_to = saved_files[0] if saved_files else None
 
         return ScanResult(
             image=resolved_image,
@@ -465,6 +514,8 @@ def scan_repository(
             status="ok" if files_copied else "copy_failed",
             env_source=env_path,
             env_saved_to=env_saved_to,
+            matched_files=matched_files,
+            saved_files=saved_files,
             error=copy_error,
         )
     finally:
@@ -485,6 +536,8 @@ def result_to_dict(result: ScanResult) -> dict[str, Any]:
         "status": result.status,
         "env_source": str(result.env_source) if result.env_source else None,
         "env_saved_to": str(result.env_saved_to) if result.env_saved_to else None,
+        "matched_files": [str(path) for path in (result.matched_files or [])],
+        "saved_files": [str(path) for path in (result.saved_files or [])],
         "error": result.error,
     }
 
@@ -509,6 +562,8 @@ def save_report(results: list[ScanResult], report_file: str) -> None:
             "status",
             "env_source",
             "env_saved_to",
+            "matched_files",
+            "saved_files",
             "error",
         ]
         with report_path.open("w", encoding="utf-8", newline="") as handle:
@@ -530,11 +585,19 @@ def print_text_results(results: list[ScanResult]) -> None:
         print(f"Pull count: {result.pull_count}")
         print(f"Status: {result.status}")
         print(f"Filesystem copied: {'yes' if result.files_copied else 'no'}")
-        print(f".env found: {'yes' if result.env_found else 'no'}")
+        print(f"Sensitive files found: {'yes' if result.env_found else 'no'}")
         if result.env_source:
-            print(f".env source: {result.env_source}")
+            print(f"First match source: {result.env_source}")
         if result.env_saved_to:
-            print(f".env saved to: {result.env_saved_to}")
+            print(f"First match saved to: {result.env_saved_to}")
+        if result.matched_files:
+            print("Matched files:")
+            for path in result.matched_files:
+                print(f"  - {path}")
+        if result.saved_files:
+            print("Saved files:")
+            for path in result.saved_files:
+                print(f"  - {path}")
         print(f"Temp dir: {result.temp_dir if result.temp_dir else 'removed'}")
         if result.error:
             print(f"Error: {result.error}")
