@@ -17,3 +17,6 @@ htmlcov/
 
 *.log
 very_good/
+
+.env
+state.db

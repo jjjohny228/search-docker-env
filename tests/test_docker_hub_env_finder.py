@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,9 +9,11 @@ from unittest.mock import patch
 
 from docker_hub_env_finder import (
     _IMAGE_USAGE_COUNTS,
+    AppConfig,
     calculate_page_offset,
     calculate_start_page,
     choose_pullable_image_reference,
+    chunk_paths,
     classify_pull_error,
     copy_found_files,
     RepositoryCandidate,
@@ -21,14 +24,24 @@ from docker_hub_env_finder import (
     extract_image_parts,
     find_env_file,
     find_sensitive_files,
+    filter_unprocessed_candidates,
     get_image_references,
+    init_db,
+    is_image_processed,
+    mark_image_processed,
     make_safe_image_name,
+    pause_on_rate_limit,
     save_report,
     scan_repository,
     scan_repositories,
+    send_telegram_file_groups,
     search_repositories,
     slice_candidates,
+    should_mark_processed,
 )
+
+
+TEST_CONFIG = AppConfig(Path("state.db"), 1, None, [])
 
 
 class ContainsEnvFileTests(unittest.TestCase):
@@ -98,8 +111,28 @@ class ResultFileTests(unittest.TestCase):
             self.assertEqual(
                 saved,
                 [
-                    root / "result" / "alice_project_latest" / "app" / "config" / ".env.local",
+                    root / "result" / "alice_project_latest" / ".env.local",
                     root / "result" / "alice_project_latest" / "settings.py",
+                ],
+            )
+
+    def test_copy_found_files_flattens_duplicate_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            first = root / "scan1" / ".env"
+            second = root / "scan2" / ".env"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.write_text("A=1", encoding="utf-8")
+            second.write_text("B=2", encoding="utf-8")
+
+            saved = copy_found_files([first, second], root, root / "result", "alice/project:latest")
+
+            self.assertEqual(
+                saved,
+                [
+                    root / "result" / "alice_project_latest" / ".env",
+                    root / "result" / "alice_project_latest" / ".env_2",
                 ],
             )
 
@@ -111,6 +144,40 @@ class ResultFileTests(unittest.TestCase):
         )
 
         self.assertEqual(classify_pull_error(error), "unsupported_manifest")
+
+    @patch("docker_hub_env_finder.time.sleep")
+    @patch("docker_hub_env_finder.send_telegram_message")
+    def test_pause_on_rate_limit_uses_config_delay(self, send_telegram_message_mock, sleep_mock) -> None:
+        config = AppConfig(Path("state.db"), 1.5, "token", ["1"])
+
+        pause_on_rate_limit(config, "alice/project:1")
+
+        sleep_mock.assert_called_once_with(5400.0)
+        send_telegram_message_mock.assert_called_once()
+
+    def test_chunk_paths(self) -> None:
+        paths = [Path(f"file_{index}.txt") for index in range(12)]
+        chunks = chunk_paths(paths, 10)
+
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(chunks[0]), 10)
+        self.assertEqual(len(chunks[1]), 2)
+
+    @patch("docker_hub_env_finder.send_telegram_multipart_request")
+    def test_send_telegram_file_groups_sends_grouped_documents(self, send_telegram_multipart_request_mock) -> None:
+        send_telegram_multipart_request_mock.return_value = (True, None)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            files = []
+            for index in range(3):
+                file_path = root / f".env_{index}"
+                file_path.write_text("KEY=VALUE", encoding="utf-8")
+                files.append(file_path)
+
+            config = AppConfig(Path("state.db"), 1, "token", ["1"])
+            send_telegram_file_groups(config, "alice/project:1", files)
+
+        self.assertEqual(send_telegram_multipart_request_mock.call_count, 1)
 
 
 class SearchRepositoriesTests(unittest.TestCase):
@@ -172,7 +239,8 @@ class SearchRepositoriesTests(unittest.TestCase):
         ]
 
         image, status, error = choose_pullable_image_reference(
-            RepositoryCandidate("1win4games", "jjjohny228", "image", 1, "")
+            RepositoryCandidate("1win4games", "jjjohny228", "image", 1, ""),
+            config=TEST_CONFIG,
         )
 
         self.assertEqual(image, "jjjohny228/1win4games:31.0.0")
@@ -319,7 +387,35 @@ class SaveReportTests(unittest.TestCase):
             with report_path.open(encoding="utf-8", newline="") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]["status"], "ok")
-            self.assertEqual(rows[0]["matched_files"], "[]")
+
+
+class DatabaseTests(unittest.TestCase):
+    def test_db_marks_and_filters_processed_images(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = AppConfig(Path(tmp_dir) / "state.db", 1, None, [])
+            init_db(config)
+            mark_image_processed(config, "alice/one", found_sensitive_files=True)
+
+            self.assertTrue(is_image_processed(config, "alice/one"))
+            self.assertFalse(is_image_processed(config, "alice/two"))
+
+            candidates = [
+                RepositoryCandidate("one", "alice", "image", 1, ""),
+                RepositoryCandidate("two", "alice", "image", 1, ""),
+            ]
+            filtered = filter_unprocessed_candidates(config, candidates)
+            self.assertEqual([item.image for item in filtered], ["alice/two"])
+
+            with sqlite3.connect(config.db_path) as conn:
+                row = conn.execute(
+                    "SELECT image, found_sensitive_files FROM processed_images WHERE image = ?",
+                    ("alice/one",),
+                ).fetchone()
+            self.assertEqual(row, ("alice/one", 1))
+
+    def test_should_mark_processed_only_after_pull_stage(self) -> None:
+        self.assertTrue(should_mark_processed(ScanResult("alice/one", 1, None, False, False, "create_failed")))
+        self.assertFalse(should_mark_processed(ScanResult("alice/one", 1, None, False, False, "pull_failed")))
 
 
 class ScanRepositoriesTests(unittest.TestCase):
@@ -341,6 +437,7 @@ class ScanRepositoriesTests(unittest.TestCase):
             keep_temp=False,
             workers=2,
             result_dir=Path("/tmp/result"),
+            config=TEST_CONFIG,
             insecure=False,
         )
 
@@ -359,6 +456,7 @@ class ScanRepositoriesTests(unittest.TestCase):
                 keep_temp=False,
                 workers=1,
                 result_dir=Path("/tmp/result"),
+                config=TEST_CONFIG,
                 insecure=False,
             )
 
@@ -397,6 +495,7 @@ class ScanRepositoryTests(unittest.TestCase):
             start_timeout=0.0,
             keep_temp=False,
             result_dir=Path("/tmp/result"),
+            config=TEST_CONFIG,
             insecure=False,
         )
 

