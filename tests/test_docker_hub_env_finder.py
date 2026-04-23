@@ -10,6 +10,7 @@ from unittest.mock import patch
 from docker_hub_env_finder import (
     _IMAGE_USAGE_COUNTS,
     AppConfig,
+    build_r2_key,
     calculate_page_offset,
     calculate_start_page,
     choose_pullable_image_reference,
@@ -37,6 +38,7 @@ from docker_hub_env_finder import (
     send_telegram_file_groups,
     search_repositories,
     slice_candidates,
+    upload_files_to_r2,
     should_mark_processed,
 )
 
@@ -62,6 +64,8 @@ class ContainsEnvFileTests(unittest.TestCase):
             app_dir.mkdir(parents=True)
             (app_dir / ".env.production").write_text("SECRET=1", encoding="utf-8")
             (app_dir / "config.json").write_text('{"token":"1"}', encoding="utf-8")
+            (app_dir / ".env.example").write_text("PUBLIC=1", encoding="utf-8")
+            (app_dir / "settings.py").write_text("DEBUG=False", encoding="utf-8")
 
             matches = find_sensitive_files(root)
 
@@ -95,16 +99,16 @@ class ResultFileTests(unittest.TestCase):
             self.assertEqual(saved, root / "result" / "alice_project_latest" / ".env")
             self.assertEqual(saved.read_text(encoding="utf-8"), "KEY=VALUE")
 
-    def test_copy_found_files_preserves_relative_paths_under_image_folder(self) -> None:
+    def test_copy_found_files_flattens_names_under_image_folder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             scan_root = root / "scan"
             config_dir = scan_root / "app" / "config"
             config_dir.mkdir(parents=True)
             first = config_dir / ".env.local"
-            second = scan_root / "settings.py"
+            second = scan_root / "config.json"
             first.write_text("KEY=VALUE", encoding="utf-8")
-            second.write_text("DEBUG=False", encoding="utf-8")
+            second.write_text('{"token":"1"}', encoding="utf-8")
 
             saved = copy_found_files([first, second], scan_root, root / "result", "alice/project:latest")
 
@@ -112,7 +116,7 @@ class ResultFileTests(unittest.TestCase):
                 saved,
                 [
                     root / "result" / "alice_project_latest" / ".env.local",
-                    root / "result" / "alice_project_latest" / "settings.py",
+                    root / "result" / "alice_project_latest" / "config.json",
                 ],
             )
 
@@ -178,6 +182,43 @@ class ResultFileTests(unittest.TestCase):
             send_telegram_file_groups(config, "alice/project:1", files)
 
         self.assertEqual(send_telegram_multipart_request_mock.call_count, 1)
+
+    def test_build_r2_key(self) -> None:
+        config = AppConfig(
+            Path("state.db"),
+            1,
+            None,
+            [],
+            r2_bucket_prefix="findings",
+        )
+
+        self.assertEqual(build_r2_key(config, "alice/project:1"), "findings/alice_project_1")
+        self.assertEqual(build_r2_key(config, "alice/project:1", ".env"), "findings/alice_project_1/.env")
+
+    @patch("docker_hub_env_finder.get_r2_client")
+    def test_upload_files_to_r2_uploads_folder_placeholder_and_files(self, get_r2_client_mock) -> None:
+        client = get_r2_client_mock.return_value
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            file_path = root / ".env"
+            file_path.write_text("KEY=VALUE", encoding="utf-8")
+            config = AppConfig(
+                Path("state.db"),
+                1,
+                None,
+                [],
+                r2_bucket_name="bucket",
+                r2_bucket_prefix="findings",
+            )
+
+            upload_files_to_r2(config, "alice/project:1", [file_path])
+
+        client.put_object.assert_called_once_with(Bucket="bucket", Key="findings/alice_project_1/", Body=b"")
+        client.upload_file.assert_called_once_with(
+            str(file_path),
+            "bucket",
+            "findings/alice_project_1/.env",
+        )
 
 
 class SearchRepositoriesTests(unittest.TestCase):

