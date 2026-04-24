@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import mimetypes
+import os
 import re
 import shutil
 import ssl
@@ -37,6 +38,7 @@ DOCKER_HUB_TAGS_URL = "https://hub.docker.com/v2/namespaces/{namespace}/reposito
 _IMAGE_USAGE_LOCK = threading.Lock()
 _IMAGE_USAGE_COUNTS: dict[str, int] = {}
 _DB_LOCK = threading.Lock()
+_PROXY_STATE_LOCK = threading.Lock()
 SENSITIVE_FILE_NAMES = {
     "config.json",
     "application.yml",
@@ -59,6 +61,8 @@ class AppConfig:
     rate_limit_wait_hours: float
     telegram_bot_token: str | None
     telegram_admin_ids: list[str]
+    proxy_file_path: Path = Path("proxies.txt")
+    proxy_state_path: Path = Path("proxy_state.json")
     r2_endpoint_url: str | None = None
     r2_access_key_id: str | None = None
     r2_secret_access_key: str | None = None
@@ -110,6 +114,8 @@ def load_config() -> AppConfig:
         rate_limit_wait_hours=rate_limit_wait_hours,
         telegram_bot_token=telegram_bot_token,
         telegram_admin_ids=telegram_admin_ids,
+        proxy_file_path=Path(parse_env_value("PROXY_FILE_PATH", "proxies.txt")),
+        proxy_state_path=Path(parse_env_value("PROXY_STATE_PATH", "proxy_state.json")),
         r2_endpoint_url=parse_env_value("R2_ENDPOINT_URL", "").strip() or None,
         r2_access_key_id=parse_env_value("R2_ACCESS_KEY_ID", "").strip() or None,
         r2_secret_access_key=parse_env_value("R2_SECRET_ACCESS_KEY", "").strip() or None,
@@ -119,7 +125,7 @@ def load_config() -> AppConfig:
 
 
 def parse_env_value(name: str, default: str) -> str:
-    return str(__import__("os").environ.get(name, default))
+    return str(os.environ.get(name, default))
 
 
 def extract_image_parts(item: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -523,6 +529,102 @@ def format_wait_duration(hours: float) -> str:
     return f"{wait_minutes}m"
 
 
+def validate_socks5_proxy(raw_value: str) -> str | None:
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    parsed = parse.urlsplit(value)
+    if parsed.scheme not in {"socks5", "socks5h"}:
+        return None
+    if not parsed.hostname or not parsed.port:
+        return None
+    return value
+
+
+def load_and_clean_proxies(config: AppConfig) -> list[str]:
+    if not config.proxy_file_path.exists():
+        return []
+
+    lines = config.proxy_file_path.read_text(encoding="utf-8").splitlines()
+    valid_proxies: list[str] = []
+    changed = False
+
+    for line in lines:
+        candidate = validate_socks5_proxy(line)
+        if candidate:
+            valid_proxies.append(candidate)
+        elif line.strip():
+            changed = True
+
+    if changed:
+        content = "\n".join(valid_proxies)
+        if content:
+            content += "\n"
+        config.proxy_file_path.write_text(content, encoding="utf-8")
+
+    return valid_proxies
+
+
+def load_proxy_state(config: AppConfig) -> dict[str, Any]:
+    if not config.proxy_state_path.exists():
+        return {"active_index": 0, "proxies": []}
+
+    try:
+        return json.loads(config.proxy_state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"active_index": 0, "proxies": []}
+
+
+def save_proxy_state(config: AppConfig, proxies: list[str], active_index: int) -> None:
+    config.proxy_state_path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "active_index": max(active_index, 0),
+        "proxies": proxies,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    config.proxy_state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def sync_proxy_state(config: AppConfig) -> list[str]:
+    with _PROXY_STATE_LOCK:
+        proxies = load_and_clean_proxies(config)
+        state = load_proxy_state(config)
+        active_index = int(state.get("active_index", 0) or 0)
+        if proxies:
+            active_index = min(active_index, len(proxies) - 1)
+        else:
+            active_index = 0
+        save_proxy_state(config, proxies, active_index)
+    return proxies
+
+
+def get_active_proxy(config: AppConfig) -> str | None:
+    proxies = sync_proxy_state(config)
+    if not proxies:
+        return None
+    state = load_proxy_state(config)
+    active_index = int(state.get("active_index", 0) or 0)
+    if active_index >= len(proxies):
+        active_index = 0
+    return proxies[active_index]
+
+
+def rotate_proxy(config: AppConfig) -> tuple[str | None, bool]:
+    with _PROXY_STATE_LOCK:
+        proxies = load_and_clean_proxies(config)
+        if not proxies:
+            save_proxy_state(config, [], 0)
+            return None, True
+
+        state = load_proxy_state(config)
+        current_index = int(state.get("active_index", 0) or 0)
+        next_index = (current_index + 1) % len(proxies)
+        wrapped = next_index == 0
+        save_proxy_state(config, proxies, next_index)
+        return proxies[next_index], wrapped
+
+
 def send_telegram_form_request(
     config: AppConfig,
     method: str,
@@ -715,6 +817,26 @@ def pause_on_rate_limit(config: AppConfig, image_reference: str) -> None:
     time.sleep(max(config.rate_limit_wait_hours, 0) * 3600)
 
 
+def handle_rate_limit(config: AppConfig, image_reference: str) -> None:
+    active_proxy = get_active_proxy(config)
+    next_proxy, wrapped = rotate_proxy(config)
+
+    if next_proxy and not wrapped:
+        print(
+            f"Pull rate limit reached for {image_reference}. Switching proxy "
+            f"from {active_proxy or 'direct'} to {next_proxy}.",
+            file=sys.stderr,
+        )
+        return
+
+    if next_proxy and wrapped:
+        print(
+            f"All proxies exhausted for {image_reference}. Returning to first proxy {next_proxy}.",
+            file=sys.stderr,
+        )
+    pause_on_rate_limit(config, image_reference)
+
+
 def choose_pullable_image_reference(
     candidate: RepositoryCandidate,
     config: AppConfig,
@@ -731,7 +853,7 @@ def choose_pullable_image_reference(
                 return image_reference, None, None
 
             if is_rate_limit_error(error_text):
-                pause_on_rate_limit(config, image_reference)
+                handle_rate_limit(config, image_reference)
                 continue
 
             last_error = error_text

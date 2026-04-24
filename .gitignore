@@ -20,3 +20,5 @@ very_good/
 
 .env
 state.db
+proxies.txt
+proxy_state.json

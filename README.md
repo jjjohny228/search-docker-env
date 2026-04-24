@@ -75,6 +75,25 @@ python3 docker_hub_env_finder.py fastapi --start-from-image owner/repo
 python3 docker_hub_env_finder.py fastapi --insecure
 ```
 
+## Прокси и Docker Compose
+
+Ротация прокси для `docker pull` рассчитана на запуск через `docker compose`, где:
+- `scanner` запускает приложение;
+- `docker` — отдельный Docker daemon (`docker:dind`);
+- `proxy-bridge` — локальный HTTP proxy bridge, который ходит через активный SOCKS5.
+
+Прокси читаются автоматически из `proxies.txt`.
+- Если файл отсутствует или пустой, работа идёт без прокси.
+- Принимаются только `socks5://` и `socks5h://`.
+- Невалидные строки автоматически удаляются из файла.
+
+Пример запуска:
+
+```bash
+docker compose build
+docker compose run --rm scanner prod --max-results 200 --workers 4 --insecure
+```
+
 ## Аргументы
 
 - `query` — поисковое слово для Docker Hub.
@@ -107,6 +126,8 @@ TELEGRAM_ADMIN_IDS=
 - `RATE_LIMIT_WAIT_HOURS` — сколько ждать при Docker Hub pull rate limit.
 - `TELEGRAM_BOT_TOKEN` — токен Telegram бота.
 - `TELEGRAM_ADMIN_IDS` — список chat id через запятую.
+- `PROXY_FILE_PATH` — путь к `proxies.txt`.
+- `PROXY_STATE_PATH` — путь к общему state-файлу для proxy bridge.
 - `R2_ENDPOINT_URL` — S3-compatible endpoint Cloudflare R2.
 - `R2_ACCESS_KEY_ID` — access key для R2.
 - `R2_SECRET_ACCESS_KEY` — secret key для R2.

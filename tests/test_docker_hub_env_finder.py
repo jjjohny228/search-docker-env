@@ -32,13 +32,16 @@ from docker_hub_env_finder import (
     mark_image_processed,
     make_safe_image_name,
     pause_on_rate_limit,
+    rotate_proxy,
     save_report,
     scan_repository,
     scan_repositories,
     send_telegram_file_groups,
     search_repositories,
     slice_candidates,
+    sync_proxy_state,
     upload_files_to_r2,
+    validate_socks5_proxy,
     should_mark_processed,
 )
 
@@ -166,6 +169,39 @@ class ResultFileTests(unittest.TestCase):
         self.assertEqual(len(chunks), 2)
         self.assertEqual(len(chunks[0]), 10)
         self.assertEqual(len(chunks[1]), 2)
+
+    def test_validate_socks5_proxy(self) -> None:
+        self.assertEqual(validate_socks5_proxy("socks5://127.0.0.1:1080"), "socks5://127.0.0.1:1080")
+        self.assertEqual(validate_socks5_proxy("socks5h://user:pass@127.0.0.1:1080"), "socks5h://user:pass@127.0.0.1:1080")
+        self.assertIsNone(validate_socks5_proxy("http://127.0.0.1:8080"))
+
+    def test_sync_proxy_state_removes_invalid_entries_and_rotates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            proxy_file = root / "proxies.txt"
+            proxy_file.write_text(
+                "socks5://127.0.0.1:1080\ninvalid\nsocks5h://127.0.0.2:1080\n",
+                encoding="utf-8",
+            )
+            config = AppConfig(
+                Path(root / "state.db"),
+                1,
+                None,
+                [],
+                proxy_file_path=proxy_file,
+                proxy_state_path=root / "proxy_state.json",
+            )
+
+            proxies = sync_proxy_state(config)
+            next_proxy, wrapped = rotate_proxy(config)
+
+            self.assertEqual(proxies, ["socks5://127.0.0.1:1080", "socks5h://127.0.0.2:1080"])
+            self.assertEqual(
+                proxy_file.read_text(encoding="utf-8"),
+                "socks5://127.0.0.1:1080\nsocks5h://127.0.0.2:1080\n",
+            )
+            self.assertEqual(next_proxy, "socks5h://127.0.0.2:1080")
+            self.assertFalse(wrapped)
 
     @patch("docker_hub_env_finder.send_telegram_multipart_request")
     def test_send_telegram_file_groups_sends_grouped_documents(self, send_telegram_multipart_request_mock) -> None:

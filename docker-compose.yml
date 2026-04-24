@@ -1,0 +1,58 @@
+services:
+  proxy-bridge:
+    build: .
+    container_name: finddockerenv-proxy-bridge
+    command: ["python3", "proxy_bridge.py"]
+    environment:
+      PROXY_STATE_PATH: /app/proxy_state.json
+      PROXY_BRIDGE_HOST: 0.0.0.0
+      PROXY_BRIDGE_PORT: 3128
+    volumes:
+      - .:/app
+    restart: unless-stopped
+
+  docker:
+    image: docker:28-dind
+    container_name: finddockerenv-docker
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+      HTTP_PROXY: http://proxy-bridge:3128
+      HTTPS_PROXY: http://proxy-bridge:3128
+      NO_PROXY: localhost,127.0.0.1,proxy-bridge,docker
+    command:
+      - --host=tcp://0.0.0.0:2375
+      - --host=unix:///var/run/docker.sock
+    depends_on:
+      - proxy-bridge
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    volumes:
+      - docker-data:/var/lib/docker
+    restart: unless-stopped
+
+  scanner:
+    build: .
+    container_name: finddockerenv-scanner
+    entrypoint: ["python3", "docker_hub_env_finder.py"]
+    environment:
+      DOCKER_HOST: tcp://docker:2375
+      DOCKER_TLS_CERTDIR: ""
+      PROXY_STATE_PATH: /app/proxy_state.json
+      PROXY_FILE_PATH: /app/proxies.txt
+    depends_on:
+      docker:
+        condition: service_healthy
+      proxy-bridge:
+        condition: service_started
+    volumes:
+      - .:/app
+    stdin_open: true
+    tty: true
+
+volumes:
+  docker-data:
