@@ -13,6 +13,14 @@ import socks
 PROXY_STATE_PATH = Path(os.environ.get("PROXY_STATE_PATH", "proxy_state.json"))
 PROXY_BRIDGE_HOST = os.environ.get("PROXY_BRIDGE_HOST", "0.0.0.0")
 PROXY_BRIDGE_PORT = int(os.environ.get("PROXY_BRIDGE_PORT", "3128"))
+EXPECTED_SOCKET_ERRORS = (
+    BrokenPipeError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    TimeoutError,
+    OSError,
+    ssl.SSLEOFError,
+)
 
 
 def load_proxy_state() -> dict:
@@ -58,26 +66,48 @@ def open_upstream_socket(host: str, port: int) -> socket.socket:
 def relay_bidirectional(client: socket.socket, upstream: socket.socket) -> None:
     sockets = [client, upstream]
     while True:
-        readable, _, exceptional = select.select(sockets, [], sockets, 30)
+        try:
+            readable, _, exceptional = select.select(sockets, [], sockets, 30)
+        except EXPECTED_SOCKET_ERRORS:
+            return
         if exceptional:
-            break
+            return
         if not readable:
             continue
 
         for source in readable:
-            data = source.recv(65536)
+            try:
+                data = source.recv(65536)
+            except EXPECTED_SOCKET_ERRORS:
+                return
             if not data:
                 return
             target = upstream if source is client else client
-            target.sendall(data)
+            try:
+                target.sendall(data)
+            except EXPECTED_SOCKET_ERRORS:
+                return
 
 
 class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def handle_error(self, request, client_address) -> None:
+        exc_type, _, _ = __import__("sys").exc_info()
+        if exc_type and issubclass(exc_type, EXPECTED_SOCKET_ERRORS):
+            return
+        super().handle_error(request, client_address)
+
 
 class ProxyHandler(socketserver.StreamRequestHandler):
+    def safe_write_response(self, payload: bytes) -> None:
+        try:
+            self.wfile.write(payload)
+            self.wfile.flush()
+        except EXPECTED_SOCKET_ERRORS:
+            return
+
     def handle(self) -> None:
         request_line = self.rfile.readline(65536)
         if not request_line:
@@ -118,12 +148,12 @@ class ProxyHandler(socketserver.StreamRequestHandler):
         upstream = None
         try:
             upstream = open_upstream_socket(host, port)
-            self.wfile.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            self.wfile.flush()
+            self.safe_write_response(b"HTTP/1.1 200 Connection established\r\n\r\n")
             relay_bidirectional(self.connection, upstream)
+        except EXPECTED_SOCKET_ERRORS:
+            return
         except Exception:
-            self.wfile.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-            self.wfile.flush()
+            self.safe_write_response(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
         finally:
             if upstream:
                 upstream.close()
@@ -162,9 +192,10 @@ class ProxyHandler(socketserver.StreamRequestHandler):
             request_bytes.append(body)
             upstream.sendall(b"".join(request_bytes))
             relay_bidirectional(self.connection, upstream)
+        except EXPECTED_SOCKET_ERRORS:
+            return
         except Exception:
-            self.wfile.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-            self.wfile.flush()
+            self.safe_write_response(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
         finally:
             if upstream:
                 upstream.close()
