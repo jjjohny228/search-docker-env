@@ -687,6 +687,7 @@ class SearchRepositoriesTests(BaseStatefulTests):
                 start_page=1,
                 start_from_index=1,
                 start_from_image=None,
+                ignore_db=False,
                 insecure=False,
             )
 
@@ -726,10 +727,43 @@ class SearchRepositoriesTests(BaseStatefulTests):
                 start_page=1,
                 start_from_index=1,
                 start_from_image=None,
+                ignore_db=False,
                 insecure=False,
             )
 
         self.assertEqual([item.image for item in results], ["alice/two", "alice/three"])
+
+    @patch("docker_hub_env_finder.fetch_search_page")
+    def test_collect_unprocessed_candidates_can_ignore_db_for_query_mode(self, fetch_search_page) -> None:
+        fetch_search_page.return_value = {
+            "next": "",
+            "results": [
+                {"repo_name": "alice/one", "repo_owner": "", "pull_count": 1, "repo_type": "image", "short_description": ""},
+                {"repo_name": "alice/two", "repo_owner": "", "pull_count": 1, "repo_type": "image", "short_description": ""},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = AppConfig(Path(tmp_dir) / "state.db", 1, None, [])
+            init_db(config)
+            mark_image_processed(config, "alice/one")
+
+            results = collect_unprocessed_candidates(
+                config=config,
+                query="alice",
+                user_images=None,
+                max_pulls=500,
+                max_results=2,
+                page_size=2,
+                max_pages=5,
+                start_page=1,
+                start_from_index=1,
+                start_from_image=None,
+                ignore_db=True,
+                insecure=False,
+            )
+
+        self.assertEqual([item.image for item in results], ["alice/one", "alice/two"])
 
 
 class SaveReportTests(BaseStatefulTests):
@@ -824,6 +858,7 @@ class ScanRepositoriesTests(BaseStatefulTests):
             workers=2,
             result_dir=Path("/tmp/result"),
             config=TEST_CONFIG,
+            ignore_db=False,
             insecure=False,
         )
 
@@ -843,6 +878,7 @@ class ScanRepositoriesTests(BaseStatefulTests):
                 workers=1,
                 result_dir=Path("/tmp/result"),
                 config=TEST_CONFIG,
+                ignore_db=False,
                 insecure=False,
             )
 
@@ -866,11 +902,36 @@ class ScanRepositoriesTests(BaseStatefulTests):
             workers=1,
             result_dir=Path("/tmp/result"),
             config=TEST_CONFIG,
+            ignore_db=False,
             insecure=False,
         )
 
         self.assertEqual([item.status for item in results], ["disk_full", "ok"])
         self.assertEqual(scan_repository_mock.call_count, 2)
+
+    @patch("docker_hub_env_finder.mark_image_processed")
+    @patch("docker_hub_env_finder.scan_repository")
+    def test_scan_repositories_does_not_write_db_when_ignore_db_enabled(
+        self,
+        scan_repository_mock,
+        mark_image_processed_mock,
+    ) -> None:
+        candidates = [RepositoryCandidate("first", "alice", "image", 1, "")]
+        scan_repository_mock.return_value = ScanResult("alice/first", 1, None, True, False, "ok")
+
+        results = scan_repositories(
+            candidates,
+            start_timeout=0.1,
+            keep_temp=False,
+            workers=1,
+            result_dir=Path("/tmp/result"),
+            config=TEST_CONFIG,
+            ignore_db=True,
+            insecure=False,
+        )
+
+        self.assertEqual([item.image for item in results], ["alice/first"])
+        mark_image_processed_mock.assert_not_called()
 
 class ScanRepositoryTests(BaseStatefulTests):
     @patch("docker_hub_env_finder.shutil.rmtree")

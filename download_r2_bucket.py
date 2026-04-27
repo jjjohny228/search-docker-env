@@ -2,7 +2,10 @@ import argparse
 import os
 from pathlib import Path
 
-import boto3
+try:
+    import boto3
+except ImportError:
+    boto3 = None
 
 try:
     from dotenv import load_dotenv
@@ -49,6 +52,8 @@ def build_r2_client():
     ]
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+    if boto3 is None:
+        raise RuntimeError("boto3 is not installed.")
 
     session = boto3.session.Session()
     return session.client(
@@ -79,7 +84,10 @@ def iter_bucket_keys(client, bucket_name: str, prefix: str):
         continuation_token = response.get("NextContinuationToken")
 
 
-def download_bucket(output_dir: Path, prefix_override: str | None = None) -> int:
+def download_bucket(
+    output_dir: Path,
+    prefix_override: str | None = None,
+) -> int:
     load_dotenv()
 
     bucket_name = parse_env("R2_BUCKET_NAME")
@@ -100,6 +108,8 @@ def download_bucket(output_dir: Path, prefix_override: str | None = None) -> int
         target_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Downloading {key} -> {target_path}")
         client.download_file(bucket_name, key, str(target_path))
+        print(f"Deleting {key} from bucket")
+        client.delete_object(Bucket=bucket_name, Key=key)
         downloaded += 1
 
     return downloaded

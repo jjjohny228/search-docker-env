@@ -31,6 +31,13 @@ python3 docker_hub_env_finder.py fastapi
 python3 docker_hub_env_finder.py --user-images ownername --max-results 200
 ```
 
+Пример полного прохода без skip по SQLite:
+
+```bash
+python3 docker_hub_env_finder.py --user-images ownername --max-results 200 --ignore-db
+python3 docker_hub_env_finder.py fastapi --max-results 200 --ignore-db
+```
+
 Пример с JSON-выводом и сохранением временных папок:
 
 ```bash
@@ -114,6 +121,7 @@ docker compose run -d --rm scanner trading --max-results 150 --workers 1 --insec
 - `--start-from-image` — начать сканирование с указанного `owner/repo`.
 - `--start-from-index` — начать сканирование с указанной позиции; стартовая страница вычисляется автоматически.
 - `--workers` — количество параллельных проверок.
+- `--ignore-db` — не проверять `processed_images` и не пропускать уже обработанные образы.
 - `--report-file` — сохранить отчёт в `.json` или `.csv`.
 - `--result-dir` — папка, куда копируются найденные `.env`.
 - `--output-json` — печатать результаты в JSON в консоль.

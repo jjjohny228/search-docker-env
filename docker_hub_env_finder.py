@@ -225,6 +225,11 @@ def parse_args() -> argparse.Namespace:
         help="Number of images to scan in parallel. Default: 1.",
     )
     parser.add_argument(
+        "--ignore-db",
+        action="store_true",
+        help="Ignore processed_images database checks and scan all matched images.",
+    )
+    parser.add_argument(
         "--report-file",
         help="Path to save the report. Supported extensions: .json, .csv.",
     )
@@ -505,6 +510,7 @@ def collect_unprocessed_candidates(
     start_page: int,
     start_from_index: int,
     start_from_image: str | None,
+    ignore_db: bool,
     insecure: bool,
 ) -> list[RepositoryCandidate]:
     collected: list[RepositoryCandidate] = []
@@ -551,7 +557,7 @@ def collect_unprocessed_candidates(
                 continue
             seen_images.add(candidate.image)
 
-            if is_image_processed(config, candidate.image):
+            if not ignore_db and is_image_processed(config, candidate.image):
                 print(f"Skipping already processed image: {candidate.image}", file=sys.stderr)
                 continue
 
@@ -1404,6 +1410,7 @@ def scan_repositories(
     workers: int,
     result_dir: Path,
     config: AppConfig,
+    ignore_db: bool,
     insecure: bool,
 ) -> list[ScanResult]:
     total = len(candidates)
@@ -1419,7 +1426,7 @@ def scan_repositories(
                 insecure=insecure,
             )
             results.append(result)
-            if should_mark_processed(result):
+            if not ignore_db and should_mark_processed(result):
                 mark_image_processed(config, item.image, found_sensitive_files=result.env_found)
             print(f"Processed {index}/{total}: {result.image} [{result.status}]", file=sys.stderr)
         return results
@@ -1436,7 +1443,7 @@ def scan_repositories(
             result_index = future_map[future]
             result = future.result()
             results_by_index[result_index] = result
-            if should_mark_processed(result):
+            if not ignore_db and should_mark_processed(result):
                 mark_image_processed(
                     config,
                     candidate_by_index[result_index].image,
@@ -1494,6 +1501,7 @@ def main() -> int:
             start_page=start_page,
             start_from_index=args.start_from_index,
             start_from_image=args.start_from_image,
+            ignore_db=args.ignore_db,
             insecure=args.insecure,
         )
     except ssl.SSLCertVerificationError as exc:
@@ -1530,6 +1538,7 @@ def main() -> int:
         workers=max(args.workers, 1),
         result_dir=Path(args.result_dir),
         config=config,
+        ignore_db=args.ignore_db,
         insecure=args.insecure,
     )
 
