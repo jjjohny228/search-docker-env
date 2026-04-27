@@ -8,7 +8,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from docker_hub_env_finder import (
-    _DISK_FULL_ABORT,
     _IMAGE_USAGE_COUNTS,
     _KNOWN_IMAGE_IDS,
     AppConfig,
@@ -58,7 +57,6 @@ class BaseStatefulTests(unittest.TestCase):
     def setUp(self) -> None:
         _IMAGE_USAGE_COUNTS.clear()
         _KNOWN_IMAGE_IDS.clear()
-        _DISK_FULL_ABORT.clear()
 
 
 class ContainsEnvFileTests(BaseStatefulTests):
@@ -340,16 +338,19 @@ class SearchRepositoriesTests(BaseStatefulTests):
         self.assertIsNone(error)
 
     @patch("docker_hub_env_finder.cleanup_docker_storage")
+    @patch("docker_hub_env_finder.time.sleep")
     @patch("docker_hub_env_finder.run_command")
     @patch("docker_hub_env_finder.get_image_references")
     def test_choose_pullable_image_reference_retries_after_disk_cleanup(
         self,
         get_image_references_mock,
         run_command_mock,
+        sleep_mock,
         cleanup_docker_storage_mock,
     ) -> None:
         get_image_references_mock.return_value = ["alice/project:1"]
         cleanup_docker_storage_mock.return_value = True
+        _IMAGE_USAGE_COUNTS["sha256:active"] = 1
         run_command_mock.side_effect = [
             type("CP", (), {"returncode": 1, "stderr": "no space left on device", "stdout": ""})(),
             type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
@@ -365,14 +366,17 @@ class SearchRepositoriesTests(BaseStatefulTests):
         self.assertIsNone(status)
         self.assertIsNone(error)
         cleanup_docker_storage_mock.assert_called_once()
+        sleep_mock.assert_called_once_with(2.0)
 
     @patch("docker_hub_env_finder.cleanup_docker_storage")
+    @patch("docker_hub_env_finder.time.sleep")
     @patch("docker_hub_env_finder.run_command")
     @patch("docker_hub_env_finder.get_image_references")
     def test_choose_pullable_image_reference_stops_after_failed_disk_cleanup(
         self,
         get_image_references_mock,
         run_command_mock,
+        sleep_mock,
         cleanup_docker_storage_mock,
     ) -> None:
         get_image_references_mock.return_value = ["alice/project:1", "alice/project:2"]
@@ -380,6 +384,11 @@ class SearchRepositoriesTests(BaseStatefulTests):
         run_command_mock.side_effect = [
             type("CP", (), {"returncode": 1, "stderr": "no space left on device", "stdout": ""})(),
             type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
+            type("CP", (), {"returncode": 1, "stderr": "no space left on device", "stdout": ""})(),
+            type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
+            type("CP", (), {"returncode": 1, "stderr": "no space left on device", "stdout": ""})(),
+            type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
+            type("CP", (), {"returncode": 1, "stderr": "no space left on device", "stdout": ""})(),
         ]
 
         image, status, error = choose_pullable_image_reference(
@@ -390,9 +399,10 @@ class SearchRepositoriesTests(BaseStatefulTests):
         self.assertIsNone(image)
         self.assertEqual(status, "disk_full")
         self.assertIn("no space left on device", error)
-        self.assertEqual(run_command_mock.call_count, 2)
+        self.assertEqual(run_command_mock.call_count, 7)
         self.assertEqual(run_command_mock.call_args_list[1].args[0], ["docker", "image", "rm", "-f", "alice/project:1"])
-        cleanup_docker_storage_mock.assert_called_once()
+        self.assertEqual(cleanup_docker_storage_mock.call_count, 3)
+        sleep_mock.assert_not_called()
 
     def test_extract_image_parts_supports_full_repo_name(self) -> None:
         namespace, name = extract_image_parts(
@@ -650,7 +660,7 @@ class ScanRepositoriesTests(BaseStatefulTests):
         self.assertIn("Processed 1/1: alice/first:1.0.0 [ok]", stderr.getvalue())
 
     @patch("docker_hub_env_finder.scan_repository")
-    def test_sequential_scan_stops_after_disk_full(self, scan_repository_mock) -> None:
+    def test_sequential_scan_continues_after_disk_full(self, scan_repository_mock) -> None:
         candidates = [
             RepositoryCandidate("first", "alice", "image", 1, ""),
             RepositoryCandidate("second", "bob", "image", 1, ""),
@@ -670,8 +680,8 @@ class ScanRepositoriesTests(BaseStatefulTests):
             insecure=False,
         )
 
-        self.assertEqual([item.status for item in results], ["disk_full"])
-        self.assertEqual(scan_repository_mock.call_count, 1)
+        self.assertEqual([item.status for item in results], ["disk_full", "ok"])
+        self.assertEqual(scan_repository_mock.call_count, 2)
 
 class ScanRepositoryTests(BaseStatefulTests):
     @patch("docker_hub_env_finder.shutil.rmtree")

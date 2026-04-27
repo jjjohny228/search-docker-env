@@ -42,7 +42,6 @@ _KNOWN_IMAGE_IDS: set[str] = set()
 _DB_LOCK = threading.Lock()
 _PROXY_STATE_LOCK = threading.Lock()
 _DOCKER_CLEANUP_LOCK = threading.Lock()
-_DISK_FULL_ABORT = threading.Event()
 SENSITIVE_FILE_NAMES = {
     "config.json",
     "application.yml",
@@ -925,6 +924,11 @@ def cleanup_docker_storage(config: AppConfig) -> bool:
         return cleanup_ok
 
 
+def has_active_image_usage() -> bool:
+    with _IMAGE_USAGE_LOCK:
+        return any(count > 0 for count in _IMAGE_USAGE_COUNTS.values())
+
+
 def handle_rate_limit(config: AppConfig, image_reference: str) -> None:
     active_proxy = get_active_proxy(config)
     next_proxy, wrapped = rotate_proxy(config)
@@ -950,17 +954,11 @@ def choose_pullable_image_reference(
     config: AppConfig,
     insecure: bool = False,
 ) -> tuple[str | None, str | None, str | None]:
-    if _DISK_FULL_ABORT.is_set():
-        return None, "disk_full", "Docker storage is full. Scan aborted until space is freed."
-
     last_error: str | None = None
     last_status: str | None = None
 
     for image_reference in get_image_references(candidate, insecure=insecure):
-        if _DISK_FULL_ABORT.is_set():
-            return None, "disk_full", "Docker storage is full. Scan aborted until space is freed."
-
-        disk_cleanup_attempted = False
+        disk_cleanup_attempts = 0
         while True:
             pull_result = run_command(["docker", "pull", image_reference], check=False)
             error_text = pull_result.stderr.strip() or pull_result.stdout.strip() or "docker pull failed"
@@ -972,14 +970,19 @@ def choose_pullable_image_reference(
                 continue
 
             if is_disk_full_error(error_text):
-                if not disk_cleanup_attempted:
-                    disk_cleanup_attempted = True
+                if disk_cleanup_attempts < 3:
+                    disk_cleanup_attempts += 1
                     run_command(["docker", "image", "rm", "-f", image_reference], check=False)
-                    cleanup_ok = cleanup_docker_storage(config)
-                    if cleanup_ok:
-                        print(f"Retrying pull for {image_reference} after docker storage cleanup.", file=sys.stderr)
-                        continue
-                _DISK_FULL_ABORT.set()
+                    cleanup_docker_storage(config)
+                    if has_active_image_usage():
+                        print(
+                            "Docker storage is still busy. Waiting for other workers to release images "
+                            f"before retrying pull for {image_reference}.",
+                            file=sys.stderr,
+                        )
+                        time.sleep(2.0)
+                    print(f"Retrying pull for {image_reference} after docker storage cleanup.", file=sys.stderr)
+                    continue
                 return None, "disk_full", error_text
 
             last_error = error_text
@@ -1227,13 +1230,10 @@ def scan_repositories(
     config: AppConfig,
     insecure: bool,
 ) -> list[ScanResult]:
-    _DISK_FULL_ABORT.clear()
     total = len(candidates)
     if workers <= 1:
         results: list[ScanResult] = []
         for index, item in enumerate(candidates, start=1):
-            if _DISK_FULL_ABORT.is_set():
-                break
             result = scan_repository(
                 item,
                 start_timeout=start_timeout,
@@ -1246,8 +1246,6 @@ def scan_repositories(
             if should_mark_processed(result):
                 mark_image_processed(config, item.image, found_sensitive_files=result.env_found)
             print(f"Processed {index}/{total}: {result.image} [{result.status}]", file=sys.stderr)
-            if result.status == "disk_full":
-                break
         return results
 
     results_by_index: dict[int, ScanResult] = {}
@@ -1270,8 +1268,6 @@ def scan_repositories(
                 )
             processed += 1
             print(f"Processed {processed}/{total}: {result.image} [{result.status}]", file=sys.stderr)
-            if result.status == "disk_full":
-                _DISK_FULL_ABORT.set()
 
     return [results_by_index[index] for index in sorted(results_by_index)]
 
