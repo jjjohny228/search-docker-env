@@ -35,6 +35,8 @@ except ImportError:
 
 DOCKER_HUB_SEARCH_URL = "https://hub.docker.com/v2/search/repositories/"
 DOCKER_HUB_TAGS_URL = "https://hub.docker.com/v2/namespaces/{namespace}/repositories/{name}/tags"
+DOCKER_HUB_NAMESPACE_REPOSITORIES_URL = "https://hub.docker.com/v2/namespaces/{namespace}/repositories"
+DOCKER_HUB_LEGACY_NAMESPACE_REPOSITORIES_URL = "https://hub.docker.com/v2/repositories/{namespace}"
 MANAGED_CONTAINER_LABEL = "find-docker-env.managed=true"
 _IMAGE_USAGE_LOCK = threading.Lock()
 _IMAGE_USAGE_COUNTS: dict[str, int] = {}
@@ -159,7 +161,18 @@ def parse_args() -> argparse.Namespace:
             "copy the full container filesystem into a temporary directory and check whether it contains a .env file."
         )
     )
-    parser.add_argument("query", help="Search query for Docker Hub.")
+    target_group = parser.add_mutually_exclusive_group(required=True)
+    target_group.add_argument("query", nargs="?", help="Search query for Docker Hub.")
+    target_group.add_argument(
+        "--user-images",
+        dest="user_images",
+        help="Scan repositories that belong to a specific Docker Hub user or namespace.",
+    )
+    target_group.add_argument(
+        "--probe-user-endpoints",
+        dest="probe_user_endpoints",
+        help="Probe Docker Hub repository-list endpoints for a specific user or namespace and print diagnostics.",
+    )
     parser.add_argument(
         "--max-results",
         type=int,
@@ -273,6 +286,98 @@ def fetch_tags_page(namespace: str, name: str, page_size: int = 25, insecure: bo
         return json.load(response)
 
 
+def fetch_namespace_repositories_page(
+    namespace: str,
+    page: int,
+    page_size: int,
+    insecure: bool = False,
+) -> dict[str, Any]:
+    params = parse.urlencode(
+        {
+            "page": page,
+            "page_size": page_size,
+            "ordering": "-last_updated",
+        }
+    )
+    context = ssl._create_unverified_context() if insecure else None
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "find-docker-env/1.0",
+    }
+
+    primary_url = f"{DOCKER_HUB_NAMESPACE_REPOSITORIES_URL.format(namespace=namespace)}?{params}"
+    try:
+        with request.urlopen(request.Request(primary_url, headers=headers), timeout=20, context=context) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        if exc.code == 404 and page > 1:
+            return {"count": 0, "next": None, "previous": None, "results": []}
+        if exc.code != 404:
+            raise
+
+    legacy_url = f"{DOCKER_HUB_LEGACY_NAMESPACE_REPOSITORIES_URL.format(namespace=namespace)}?{params}"
+    try:
+        with request.urlopen(request.Request(legacy_url, headers=headers), timeout=20, context=context) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        if exc.code == 404 and page > 1:
+            return {"count": 0, "next": None, "previous": None, "results": []}
+        if exc.code == 404:
+            raise RuntimeError(
+                f"Docker Hub namespace '{namespace}' was not found or has no public repositories."
+            ) from exc
+        raise
+
+
+def probe_namespace_endpoint(url: str, insecure: bool = False) -> dict[str, Any]:
+    context = ssl._create_unverified_context() if insecure else None
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "find-docker-env/1.0",
+    }
+
+    try:
+        with request.urlopen(request.Request(url, headers=headers), timeout=20, context=context) as response:
+            payload = json.load(response)
+        return {
+            "url": url,
+            "ok": True,
+            "status_code": 200,
+            "count": int(payload.get("count") or len(payload.get("results", []))),
+            "sample_names": [item.get("name") for item in payload.get("results", [])[:5] if item.get("name")],
+            "next": payload.get("next"),
+        }
+    except HTTPError as exc:
+        return {
+            "url": url,
+            "ok": False,
+            "status_code": exc.code,
+            "error": exc.reason or exc.msg,
+        }
+    except URLError as exc:
+        return {
+            "url": url,
+            "ok": False,
+            "status_code": None,
+            "error": str(exc.reason or exc),
+        }
+
+
+def probe_namespace_endpoints(namespace: str, page_size: int, insecure: bool = False) -> list[dict[str, Any]]:
+    params = parse.urlencode(
+        {
+            "page": 1,
+            "page_size": page_size,
+            "ordering": "-last_updated",
+        }
+    )
+    candidate_urls = [
+        f"{DOCKER_HUB_NAMESPACE_REPOSITORIES_URL.format(namespace=namespace)}?{params}",
+        f"{DOCKER_HUB_LEGACY_NAMESPACE_REPOSITORIES_URL.format(namespace=namespace)}?{params}",
+    ]
+    return [probe_namespace_endpoint(url, insecure=insecure) for url in candidate_urls]
+
+
 def get_image_references(candidate: RepositoryCandidate, insecure: bool = False, limit: int = 10) -> list[str]:
     payload = fetch_tags_page(candidate.namespace, candidate.name, insecure=insecure)
     tags = [item.get("name") for item in payload.get("results", []) if item.get("name")]
@@ -330,9 +435,69 @@ def search_repositories(
     return results
 
 
+def list_namespace_repositories(
+    namespace: str,
+    max_pulls: int,
+    max_results: int,
+    page_size: int,
+    max_pages: int,
+    start_page: int = 1,
+    insecure: bool = False,
+) -> list[RepositoryCandidate]:
+    results: list[RepositoryCandidate] = []
+    page = max(start_page, 1)
+    has_next_page = True
+    pages_checked = 0
+
+    while len(results) < max_results and has_next_page and pages_checked < max_pages:
+        payload = fetch_namespace_repositories_page(
+            namespace=namespace,
+            page=page,
+            page_size=page_size,
+            insecure=insecure,
+        )
+        raw_items = payload.get("results", [])
+        if not raw_items:
+            break
+
+        for item in raw_items:
+            pull_count = int(item.get("pull_count") or 0)
+            if pull_count >= max_pulls:
+                continue
+
+            item_namespace, name = extract_image_parts(
+                {
+                    "name": item.get("name"),
+                    "namespace": item.get("namespace") or namespace,
+                }
+            )
+            if not item_namespace or not name:
+                continue
+
+            results.append(
+                RepositoryCandidate(
+                    name=name,
+                    namespace=item_namespace,
+                    repository_type=item.get("repository_type", "image"),
+                    pull_count=pull_count,
+                    description=item.get("description") or item.get("short_description") or "",
+                )
+            )
+
+            if len(results) >= max_results:
+                break
+
+        has_next_page = bool(payload.get("next"))
+        page += 1
+        pages_checked += 1
+
+    return results
+
+
 def collect_unprocessed_candidates(
     config: AppConfig,
-    query: str,
+    query: str | None,
+    user_images: str | None,
     max_pulls: int,
     max_results: int,
     page_size: int,
@@ -350,15 +515,26 @@ def collect_unprocessed_candidates(
     apply_initial_offset = True
 
     while len(collected) < max_results and pages_checked < max_pages:
-        page_candidates = search_repositories(
-            query=query,
-            max_pulls=max_pulls,
-            max_results=page_size,
-            page_size=page_size,
-            max_pages=1,
-            start_page=current_page,
-            insecure=insecure,
-        )
+        if user_images:
+            page_candidates = list_namespace_repositories(
+                namespace=user_images,
+                max_pulls=max_pulls,
+                max_results=page_size,
+                page_size=page_size,
+                max_pages=1,
+                start_page=current_page,
+                insecure=insecure,
+            )
+        else:
+            page_candidates = search_repositories(
+                query=query or "",
+                max_pulls=max_pulls,
+                max_results=page_size,
+                page_size=page_size,
+                max_pages=1,
+                start_page=current_page,
+                insecure=insecure,
+            )
         if not page_candidates:
             break
 
@@ -1272,10 +1448,36 @@ def scan_repositories(
     return [results_by_index[index] for index in sorted(results_by_index)]
 
 
+def print_namespace_probe_results(results: list[dict[str, Any]]) -> None:
+    print(json.dumps(results, indent=2, ensure_ascii=False))
+
+
 def main() -> int:
     args = parse_args()
     config = load_config()
     config.insecure_network = args.insecure
+
+    if args.probe_user_endpoints:
+        try:
+            results = probe_namespace_endpoints(
+                namespace=args.probe_user_endpoints,
+                page_size=args.page_size,
+                insecure=args.insecure,
+            )
+        except ssl.SSLCertVerificationError as exc:
+            print(
+                "TLS certificate verification failed while talking to Docker Hub. "
+                "Retry with --insecure if you trust this network/environment.\n"
+                f"Details: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        except URLError as exc:
+            print(f"Network error while talking to Docker Hub: {exc}", file=sys.stderr)
+            return 1
+
+        print_namespace_probe_results(results)
+        return 0
 
     try:
         ensure_docker_available()
@@ -1284,6 +1486,7 @@ def main() -> int:
         candidates = collect_unprocessed_candidates(
             config=config,
             query=args.query,
+            user_images=args.user_images,
             max_pulls=args.max_pulls,
             max_results=args.max_results,
             page_size=args.page_size,

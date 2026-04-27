@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from docker_hub_env_finder import (
     _IMAGE_USAGE_COUNTS,
@@ -27,6 +28,7 @@ from docker_hub_env_finder import (
     contains_env_file,
     copy_found_env,
     extract_image_parts,
+    fetch_namespace_repositories_page,
     find_env_file,
     find_sensitive_files,
     filter_unprocessed_candidates,
@@ -36,11 +38,14 @@ from docker_hub_env_finder import (
     mark_image_processed,
     make_safe_image_name,
     pause_on_rate_limit,
+    probe_namespace_endpoint,
+    probe_namespace_endpoints,
     rotate_proxy,
     save_report,
     scan_repository,
     scan_repositories,
     send_telegram_file_groups,
+    list_namespace_repositories,
     search_repositories,
     slice_candidates,
     sync_proxy_state,
@@ -271,6 +276,150 @@ class ResultFileTests(BaseStatefulTests):
 
 
 class SearchRepositoriesTests(BaseStatefulTests):
+    @patch("docker_hub_env_finder.request.urlopen")
+    def test_probe_namespace_endpoint_reports_success_payload(self, urlopen_mock) -> None:
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            {
+                "count": 26,
+                "next": "https://hub.docker.com/v2/namespaces/jjjohny228/repositories?page=2&page_size=2",
+                "results": [
+                    {"name": "time-app-frontend"},
+                    {"name": "time-app-backend"},
+                ],
+            }
+        ).encode("utf-8")
+        urlopen_mock.return_value = response
+
+        result = probe_namespace_endpoint(
+            "https://hub.docker.com/v2/namespaces/jjjohny228/repositories?page_size=2"
+        )
+
+        self.assertEqual(result["status_code"], 200)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 26)
+        self.assertEqual(result["sample_names"], ["time-app-frontend", "time-app-backend"])
+
+    @patch("docker_hub_env_finder.probe_namespace_endpoint")
+    def test_probe_namespace_endpoints_returns_both_candidate_urls(self, probe_namespace_endpoint_mock) -> None:
+        probe_namespace_endpoint_mock.side_effect = [
+            {"url": "first", "ok": True, "status_code": 200},
+            {"url": "second", "ok": True, "status_code": 200},
+        ]
+        results = probe_namespace_endpoints("jjjohny228", page_size=2)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual([item["url"] for item in results], ["first", "second"])
+        self.assertEqual(
+            [call.args[0] for call in probe_namespace_endpoint_mock.call_args_list],
+            [
+                "https://hub.docker.com/v2/namespaces/jjjohny228/repositories?page=1&page_size=2&ordering=-last_updated",
+                "https://hub.docker.com/v2/repositories/jjjohny228?page=1&page_size=2&ordering=-last_updated",
+            ],
+        )
+
+    @patch("docker_hub_env_finder.request.urlopen")
+    def test_fetch_namespace_repositories_page_falls_back_to_legacy_endpoint(self, urlopen_mock) -> None:
+        primary_error = HTTPError(
+            url="https://hub.docker.com/v2/namespaces/alice/repositories?page=1&page_size=100&ordering=-last_updated",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=None,
+        )
+        legacy_response = unittest.mock.MagicMock()
+        legacy_response.__enter__.return_value.read.return_value = json.dumps({"next": "", "results": []}).encode("utf-8")
+        legacy_response.__enter__.return_value.__iter__ = None
+
+        urlopen_mock.side_effect = [primary_error, legacy_response]
+
+        payload = fetch_namespace_repositories_page("alice", 1, 100)
+
+        self.assertEqual(payload, {"next": "", "results": []})
+        self.assertEqual(urlopen_mock.call_count, 2)
+
+    @patch("docker_hub_env_finder.request.urlopen")
+    def test_fetch_namespace_repositories_page_raises_clear_error_for_missing_namespace(self, urlopen_mock) -> None:
+        primary_error = HTTPError(
+            url="https://hub.docker.com/v2/namespaces/missing/repositories?page=1&page_size=100&ordering=-last_updated",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=None,
+        )
+        legacy_error = HTTPError(
+            url="https://hub.docker.com/v2/repositories/missing?page=1&page_size=100&ordering=-last_updated",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=None,
+        )
+        urlopen_mock.side_effect = [primary_error, legacy_error]
+
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_namespace_repositories_page("missing", 1, 100)
+
+        self.assertIn("namespace 'missing' was not found", str(ctx.exception))
+
+    @patch("docker_hub_env_finder.request.urlopen")
+    def test_fetch_namespace_repositories_page_treats_page_overflow_as_empty_page(self, urlopen_mock) -> None:
+        page_overflow_error = HTTPError(
+            url="https://hub.docker.com/v2/namespaces/jjjohny228/repositories?page=2&page_size=100&ordering=-last_updated",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=None,
+        )
+        urlopen_mock.side_effect = [page_overflow_error]
+
+        payload = fetch_namespace_repositories_page("jjjohny228", 2, 100)
+
+        self.assertEqual(payload["results"], [])
+        self.assertIsNone(payload["next"])
+
+    @patch("docker_hub_env_finder.fetch_namespace_repositories_page")
+    def test_list_namespace_repositories_reads_user_repositories(self, fetch_namespace_repositories_page_mock) -> None:
+        fetch_namespace_repositories_page_mock.return_value = {
+            "next": "",
+            "results": [
+                {
+                    "name": "service-one",
+                    "namespace": "alice",
+                    "pull_count": 12,
+                    "repository_type": "image",
+                    "description": "svc",
+                },
+                {
+                    "name": "service-two",
+                    "namespace": "alice",
+                    "pull_count": 700,
+                    "repository_type": "image",
+                    "description": "too popular",
+                },
+            ],
+        }
+
+        results = list_namespace_repositories(
+            namespace="alice",
+            max_pulls=500,
+            max_results=10,
+            page_size=100,
+            max_pages=5,
+        )
+
+        self.assertEqual(
+            results,
+            [
+                RepositoryCandidate(
+                    name="service-one",
+                    namespace="alice",
+                    repository_type="image",
+                    pull_count=12,
+                    description="svc",
+                )
+            ],
+        )
+
     def test_calculate_start_page(self) -> None:
         self.assertEqual(calculate_start_page(230, 100), 3)
 
@@ -530,6 +679,7 @@ class SearchRepositoriesTests(BaseStatefulTests):
             results = collect_unprocessed_candidates(
                 config=config,
                 query="alice",
+                user_images=None,
                 max_pulls=500,
                 max_results=2,
                 page_size=2,
@@ -541,6 +691,45 @@ class SearchRepositoriesTests(BaseStatefulTests):
             )
 
         self.assertEqual([item.image for item in results], ["alice/three", "alice/four"])
+
+    @patch("docker_hub_env_finder.fetch_namespace_repositories_page")
+    def test_collect_unprocessed_candidates_supports_user_images_mode(self, fetch_namespace_repositories_page_mock) -> None:
+        fetch_namespace_repositories_page_mock.side_effect = [
+            {
+                "next": "page2",
+                "results": [
+                    {"name": "one", "namespace": "alice", "pull_count": 1, "repository_type": "image", "description": ""},
+                    {"name": "two", "namespace": "alice", "pull_count": 1, "repository_type": "image", "description": ""},
+                ],
+            },
+            {
+                "next": "",
+                "results": [
+                    {"name": "three", "namespace": "alice", "pull_count": 1, "repository_type": "image", "description": ""},
+                ],
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = AppConfig(Path(tmp_dir) / "state.db", 1, None, [])
+            init_db(config)
+            mark_image_processed(config, "alice/one")
+
+            results = collect_unprocessed_candidates(
+                config=config,
+                query=None,
+                user_images="alice",
+                max_pulls=500,
+                max_results=2,
+                page_size=2,
+                max_pages=5,
+                start_page=1,
+                start_from_index=1,
+                start_from_image=None,
+                insecure=False,
+            )
+
+        self.assertEqual([item.image for item in results], ["alice/two", "alice/three"])
 
 
 class SaveReportTests(BaseStatefulTests):
