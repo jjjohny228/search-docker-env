@@ -39,6 +39,7 @@ _IMAGE_USAGE_LOCK = threading.Lock()
 _IMAGE_USAGE_COUNTS: dict[str, int] = {}
 _DB_LOCK = threading.Lock()
 _PROXY_STATE_LOCK = threading.Lock()
+_DOCKER_CLEANUP_LOCK = threading.Lock()
 SENSITIVE_FILE_NAMES = {
     "config.json",
     "application.yml",
@@ -327,6 +328,65 @@ def search_repositories(
     return results
 
 
+def collect_unprocessed_candidates(
+    config: AppConfig,
+    query: str,
+    max_pulls: int,
+    max_results: int,
+    page_size: int,
+    max_pages: int,
+    start_page: int,
+    start_from_index: int,
+    start_from_image: str | None,
+    insecure: bool,
+) -> list[RepositoryCandidate]:
+    collected: list[RepositoryCandidate] = []
+    seen_images: set[str] = set()
+    current_page = max(start_page, 1)
+    pages_checked = 0
+    page_offset = calculate_page_offset(start_from_index, page_size)
+    apply_initial_offset = True
+
+    while len(collected) < max_results and pages_checked < max_pages:
+        page_candidates = search_repositories(
+            query=query,
+            max_pulls=max_pulls,
+            max_results=page_size,
+            page_size=page_size,
+            max_pages=1,
+            start_page=current_page,
+            insecure=insecure,
+        )
+        if not page_candidates:
+            break
+
+        if apply_initial_offset:
+            page_candidates = page_candidates[page_offset:]
+            apply_initial_offset = False
+
+        if start_from_image:
+            page_candidates = slice_candidates(page_candidates, start_from_index=1, start_from_image=start_from_image)
+            start_from_image = None
+
+        for candidate in page_candidates:
+            if candidate.image in seen_images:
+                continue
+            seen_images.add(candidate.image)
+
+            if is_image_processed(config, candidate.image):
+                print(f"Skipping already processed image: {candidate.image}", file=sys.stderr)
+                continue
+
+            collected.append(candidate)
+            if len(collected) >= max_results:
+                break
+
+        current_page += 1
+        pages_checked += 1
+
+    return collected
+
+
 def slice_candidates(
     candidates: list[RepositoryCandidate],
     start_from_index: int = 1,
@@ -511,12 +571,18 @@ def classify_pull_error(error: str) -> str:
     normalized = error.lower()
     if "manifest.v1+prettyjws" in normalized or "no longer supported since containerd" in normalized:
         return "unsupported_manifest"
+    if "no space left on device" in normalized:
+        return "disk_full"
     return "pull_failed"
 
 
 def is_rate_limit_error(error: str) -> bool:
     normalized = error.lower()
     return "unauthenticated pull rate limit" in normalized or "increase-rate-limit" in normalized
+
+
+def is_disk_full_error(error: str) -> bool:
+    return "no space left on device" in error.lower()
 
 
 def format_wait_duration(hours: float) -> str:
@@ -817,6 +883,14 @@ def pause_on_rate_limit(config: AppConfig, image_reference: str) -> None:
     time.sleep(max(config.rate_limit_wait_hours, 0) * 3600)
 
 
+def cleanup_docker_storage(config: AppConfig) -> bool:
+    with _DOCKER_CLEANUP_LOCK:
+        print("Docker storage appears full. Running docker system prune -af --volumes.", file=sys.stderr)
+        send_telegram_message(config, "Docker storage is full. Running docker system prune -af --volumes.")
+        result = run_command(["docker", "system", "prune", "-af", "--volumes"], check=False)
+        return result.returncode == 0
+
+
 def handle_rate_limit(config: AppConfig, image_reference: str) -> None:
     active_proxy = get_active_proxy(config)
     next_proxy, wrapped = rotate_proxy(config)
@@ -846,6 +920,7 @@ def choose_pullable_image_reference(
     last_status: str | None = None
 
     for image_reference in get_image_references(candidate, insecure=insecure):
+        disk_cleanup_attempted = False
         while True:
             pull_result = run_command(["docker", "pull", image_reference], check=False)
             error_text = pull_result.stderr.strip() or pull_result.stdout.strip() or "docker pull failed"
@@ -855,6 +930,17 @@ def choose_pullable_image_reference(
             if is_rate_limit_error(error_text):
                 handle_rate_limit(config, image_reference)
                 continue
+
+            if is_disk_full_error(error_text):
+                if not disk_cleanup_attempted:
+                    disk_cleanup_attempted = True
+                    cleanup_ok = cleanup_docker_storage(config)
+                    if cleanup_ok:
+                        print(f"Retrying pull for {image_reference} after docker storage cleanup.", file=sys.stderr)
+                        continue
+                last_error = error_text
+                last_status = "disk_full"
+                break
 
             last_error = error_text
             last_status = classify_pull_error(last_error)
@@ -1149,22 +1235,18 @@ def main() -> int:
         ensure_docker_available()
         init_db(config)
         start_page = calculate_start_page(args.start_from_index, args.page_size)
-        page_offset = calculate_page_offset(args.start_from_index, args.page_size)
-        candidates = search_repositories(
+        candidates = collect_unprocessed_candidates(
+            config=config,
             query=args.query,
             max_pulls=args.max_pulls,
             max_results=args.max_results,
             page_size=args.page_size,
             max_pages=args.max_pages,
             start_page=start_page,
+            start_from_index=args.start_from_index,
+            start_from_image=args.start_from_image,
             insecure=args.insecure,
         )
-        candidates = slice_candidates(
-            candidates,
-            start_from_index=page_offset + 1,
-            start_from_image=args.start_from_image,
-        )
-        candidates = filter_unprocessed_candidates(config, candidates)
     except ssl.SSLCertVerificationError as exc:
         print(
             "TLS certificate verification failed while talking to Docker Hub. "

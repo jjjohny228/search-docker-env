@@ -13,9 +13,11 @@ from docker_hub_env_finder import (
     build_r2_key,
     calculate_page_offset,
     calculate_start_page,
+    cleanup_docker_storage,
     choose_pullable_image_reference,
     chunk_paths,
     classify_pull_error,
+    collect_unprocessed_candidates,
     copy_found_files,
     RepositoryCandidate,
     ScanResult,
@@ -151,6 +153,9 @@ class ResultFileTests(unittest.TestCase):
         )
 
         self.assertEqual(classify_pull_error(error), "unsupported_manifest")
+
+    def test_classify_pull_error_for_disk_full(self) -> None:
+        self.assertEqual(classify_pull_error("write /tmp/file: no space left on device"), "disk_full")
 
     @patch("docker_hub_env_finder.time.sleep")
     @patch("docker_hub_env_finder.send_telegram_message")
@@ -324,6 +329,32 @@ class SearchRepositoriesTests(unittest.TestCase):
         self.assertIsNone(status)
         self.assertIsNone(error)
 
+    @patch("docker_hub_env_finder.cleanup_docker_storage")
+    @patch("docker_hub_env_finder.run_command")
+    @patch("docker_hub_env_finder.get_image_references")
+    def test_choose_pullable_image_reference_retries_after_disk_cleanup(
+        self,
+        get_image_references_mock,
+        run_command_mock,
+        cleanup_docker_storage_mock,
+    ) -> None:
+        get_image_references_mock.return_value = ["alice/project:1"]
+        cleanup_docker_storage_mock.return_value = True
+        run_command_mock.side_effect = [
+            type("CP", (), {"returncode": 1, "stderr": "no space left on device", "stdout": ""})(),
+            type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
+        ]
+
+        image, status, error = choose_pullable_image_reference(
+            RepositoryCandidate("project", "alice", "image", 1, ""),
+            config=TEST_CONFIG,
+        )
+
+        self.assertEqual(image, "alice/project:1")
+        self.assertIsNone(status)
+        self.assertIsNone(error)
+        cleanup_docker_storage_mock.assert_called_once()
+
     def test_extract_image_parts_supports_full_repo_name(self) -> None:
         namespace, name = extract_image_parts(
             {
@@ -421,6 +452,46 @@ class SearchRepositoriesTests(unittest.TestCase):
 
         self.assertEqual(results, [])
         self.assertEqual(fetch_search_page.call_count, 1)
+
+    @patch("docker_hub_env_finder.fetch_search_page")
+    def test_collect_unprocessed_candidates_keeps_fetching_until_max_results(self, fetch_search_page) -> None:
+        fetch_search_page.side_effect = [
+            {
+                "next": "page2",
+                "results": [
+                    {"repo_name": "alice/one", "repo_owner": "", "pull_count": 1, "repo_type": "image", "short_description": ""},
+                    {"repo_name": "alice/two", "repo_owner": "", "pull_count": 1, "repo_type": "image", "short_description": ""},
+                ],
+            },
+            {
+                "next": "",
+                "results": [
+                    {"repo_name": "alice/three", "repo_owner": "", "pull_count": 1, "repo_type": "image", "short_description": ""},
+                    {"repo_name": "alice/four", "repo_owner": "", "pull_count": 1, "repo_type": "image", "short_description": ""},
+                ],
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = AppConfig(Path(tmp_dir) / "state.db", 1, None, [])
+            init_db(config)
+            mark_image_processed(config, "alice/one")
+            mark_image_processed(config, "alice/two")
+
+            results = collect_unprocessed_candidates(
+                config=config,
+                query="alice",
+                max_pulls=500,
+                max_results=2,
+                page_size=2,
+                max_pages=5,
+                start_page=1,
+                start_from_index=1,
+                start_from_image=None,
+                insecure=False,
+            )
+
+        self.assertEqual([item.image for item in results], ["alice/three", "alice/four"])
 
 
 class SaveReportTests(unittest.TestCase):
