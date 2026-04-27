@@ -35,11 +35,14 @@ except ImportError:
 
 DOCKER_HUB_SEARCH_URL = "https://hub.docker.com/v2/search/repositories/"
 DOCKER_HUB_TAGS_URL = "https://hub.docker.com/v2/namespaces/{namespace}/repositories/{name}/tags"
+MANAGED_CONTAINER_LABEL = "find-docker-env.managed=true"
 _IMAGE_USAGE_LOCK = threading.Lock()
 _IMAGE_USAGE_COUNTS: dict[str, int] = {}
+_KNOWN_IMAGE_IDS: set[str] = set()
 _DB_LOCK = threading.Lock()
 _PROXY_STATE_LOCK = threading.Lock()
 _DOCKER_CLEANUP_LOCK = threading.Lock()
+_DISK_FULL_ABORT = threading.Event()
 SENSITIVE_FILE_NAMES = {
     "config.json",
     "application.yml",
@@ -549,6 +552,7 @@ def inspect_container_image_id(container_name: str) -> str | None:
 def register_image_usage(image_id: str) -> None:
     with _IMAGE_USAGE_LOCK:
         _IMAGE_USAGE_COUNTS[image_id] = _IMAGE_USAGE_COUNTS.get(image_id, 0) + 1
+        _KNOWN_IMAGE_IDS.add(image_id)
 
 
 def cleanup_image(image_id: str) -> None:
@@ -565,6 +569,8 @@ def cleanup_image(image_id: str) -> None:
 
     if should_remove:
         run_command(["docker", "image", "rm", "-f", image_id], check=False)
+        with _IMAGE_USAGE_LOCK:
+            _KNOWN_IMAGE_IDS.discard(image_id)
 
 
 def classify_pull_error(error: str) -> str:
@@ -885,10 +891,38 @@ def pause_on_rate_limit(config: AppConfig, image_reference: str) -> None:
 
 def cleanup_docker_storage(config: AppConfig) -> bool:
     with _DOCKER_CLEANUP_LOCK:
-        print("Docker storage appears full. Running docker system prune -af --volumes.", file=sys.stderr)
-        send_telegram_message(config, "Docker storage is full. Running docker system prune -af --volumes.")
-        result = run_command(["docker", "system", "prune", "-af", "--volumes"], check=False)
-        return result.returncode == 0
+        print("Docker storage appears full. Cleaning up scanner-owned Docker resources.", file=sys.stderr)
+        send_telegram_message(config, "Docker storage is full. Cleaning up scanner-owned Docker resources.")
+
+        run_command(
+            [
+                "docker",
+                "container",
+                "prune",
+                "-f",
+                "--filter",
+                f"label={MANAGED_CONTAINER_LABEL}",
+            ],
+            check=False,
+        )
+
+        with _IMAGE_USAGE_LOCK:
+            removable_image_ids = [
+                image_id
+                for image_id in sorted(_KNOWN_IMAGE_IDS)
+                if _IMAGE_USAGE_COUNTS.get(image_id, 0) <= 0
+            ]
+
+        cleanup_ok = True
+        for image_id in removable_image_ids:
+            remove_result = run_command(["docker", "image", "rm", "-f", image_id], check=False)
+            if remove_result.returncode == 0:
+                with _IMAGE_USAGE_LOCK:
+                    _KNOWN_IMAGE_IDS.discard(image_id)
+            else:
+                cleanup_ok = False
+
+        return cleanup_ok
 
 
 def handle_rate_limit(config: AppConfig, image_reference: str) -> None:
@@ -916,10 +950,16 @@ def choose_pullable_image_reference(
     config: AppConfig,
     insecure: bool = False,
 ) -> tuple[str | None, str | None, str | None]:
+    if _DISK_FULL_ABORT.is_set():
+        return None, "disk_full", "Docker storage is full. Scan aborted until space is freed."
+
     last_error: str | None = None
     last_status: str | None = None
 
     for image_reference in get_image_references(candidate, insecure=insecure):
+        if _DISK_FULL_ABORT.is_set():
+            return None, "disk_full", "Docker storage is full. Scan aborted until space is freed."
+
         disk_cleanup_attempted = False
         while True:
             pull_result = run_command(["docker", "pull", image_reference], check=False)
@@ -934,13 +974,13 @@ def choose_pullable_image_reference(
             if is_disk_full_error(error_text):
                 if not disk_cleanup_attempted:
                     disk_cleanup_attempted = True
+                    run_command(["docker", "image", "rm", "-f", image_reference], check=False)
                     cleanup_ok = cleanup_docker_storage(config)
                     if cleanup_ok:
                         print(f"Retrying pull for {image_reference} after docker storage cleanup.", file=sys.stderr)
                         continue
-                last_error = error_text
-                last_status = "disk_full"
-                break
+                _DISK_FULL_ABORT.set()
+                return None, "disk_full", error_text
 
             last_error = error_text
             last_status = classify_pull_error(last_error)
@@ -1025,7 +1065,10 @@ def scan_repository(
                 error=pull_error,
             )
 
-        create_result = run_command(["docker", "create", "--name", container_name, resolved_image], check=False)
+        create_result = run_command(
+            ["docker", "create", "--label", MANAGED_CONTAINER_LABEL, "--name", container_name, resolved_image],
+            check=False,
+        )
         if create_result.returncode != 0:
             error = create_result.stderr.strip() or create_result.stdout.strip() or "docker create failed"
             return ScanResult(
@@ -1184,10 +1227,13 @@ def scan_repositories(
     config: AppConfig,
     insecure: bool,
 ) -> list[ScanResult]:
+    _DISK_FULL_ABORT.clear()
     total = len(candidates)
     if workers <= 1:
         results: list[ScanResult] = []
         for index, item in enumerate(candidates, start=1):
+            if _DISK_FULL_ABORT.is_set():
+                break
             result = scan_repository(
                 item,
                 start_timeout=start_timeout,
@@ -1200,6 +1246,8 @@ def scan_repositories(
             if should_mark_processed(result):
                 mark_image_processed(config, item.image, found_sensitive_files=result.env_found)
             print(f"Processed {index}/{total}: {result.image} [{result.status}]", file=sys.stderr)
+            if result.status == "disk_full":
+                break
         return results
 
     results_by_index: dict[int, ScanResult] = {}
@@ -1222,6 +1270,8 @@ def scan_repositories(
                 )
             processed += 1
             print(f"Processed {processed}/{total}: {result.image} [{result.status}]", file=sys.stderr)
+            if result.status == "disk_full":
+                _DISK_FULL_ABORT.set()
 
     return [results_by_index[index] for index in sorted(results_by_index)]
 

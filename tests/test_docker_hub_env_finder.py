@@ -8,8 +8,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from docker_hub_env_finder import (
+    _DISK_FULL_ABORT,
     _IMAGE_USAGE_COUNTS,
+    _KNOWN_IMAGE_IDS,
     AppConfig,
+    MANAGED_CONTAINER_LABEL,
     build_r2_key,
     calculate_page_offset,
     calculate_start_page,
@@ -51,7 +54,14 @@ from docker_hub_env_finder import (
 TEST_CONFIG = AppConfig(Path("state.db"), 1, None, [])
 
 
-class ContainsEnvFileTests(unittest.TestCase):
+class BaseStatefulTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _IMAGE_USAGE_COUNTS.clear()
+        _KNOWN_IMAGE_IDS.clear()
+        _DISK_FULL_ABORT.clear()
+
+
+class ContainsEnvFileTests(BaseStatefulTests):
     def test_detects_env_file_recursively(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -88,7 +98,7 @@ class ContainsEnvFileTests(unittest.TestCase):
             self.assertIsNone(find_env_file(root))
 
 
-class ResultFileTests(unittest.TestCase):
+class ResultFileTests(BaseStatefulTests):
     def test_make_safe_image_name(self) -> None:
         self.assertEqual(make_safe_image_name("alice/project:latest"), "alice_project_latest")
 
@@ -262,7 +272,7 @@ class ResultFileTests(unittest.TestCase):
         )
 
 
-class SearchRepositoriesTests(unittest.TestCase):
+class SearchRepositoriesTests(BaseStatefulTests):
     def test_calculate_start_page(self) -> None:
         self.assertEqual(calculate_start_page(230, 100), 3)
 
@@ -343,6 +353,7 @@ class SearchRepositoriesTests(unittest.TestCase):
         run_command_mock.side_effect = [
             type("CP", (), {"returncode": 1, "stderr": "no space left on device", "stdout": ""})(),
             type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
+            type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
         ]
 
         image, status, error = choose_pullable_image_reference(
@@ -353,6 +364,34 @@ class SearchRepositoriesTests(unittest.TestCase):
         self.assertEqual(image, "alice/project:1")
         self.assertIsNone(status)
         self.assertIsNone(error)
+        cleanup_docker_storage_mock.assert_called_once()
+
+    @patch("docker_hub_env_finder.cleanup_docker_storage")
+    @patch("docker_hub_env_finder.run_command")
+    @patch("docker_hub_env_finder.get_image_references")
+    def test_choose_pullable_image_reference_stops_after_failed_disk_cleanup(
+        self,
+        get_image_references_mock,
+        run_command_mock,
+        cleanup_docker_storage_mock,
+    ) -> None:
+        get_image_references_mock.return_value = ["alice/project:1", "alice/project:2"]
+        cleanup_docker_storage_mock.return_value = False
+        run_command_mock.side_effect = [
+            type("CP", (), {"returncode": 1, "stderr": "no space left on device", "stdout": ""})(),
+            type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
+        ]
+
+        image, status, error = choose_pullable_image_reference(
+            RepositoryCandidate("project", "alice", "image", 1, ""),
+            config=TEST_CONFIG,
+        )
+
+        self.assertIsNone(image)
+        self.assertEqual(status, "disk_full")
+        self.assertIn("no space left on device", error)
+        self.assertEqual(run_command_mock.call_count, 2)
+        self.assertEqual(run_command_mock.call_args_list[1].args[0], ["docker", "image", "rm", "-f", "alice/project:1"])
         cleanup_docker_storage_mock.assert_called_once()
 
     def test_extract_image_parts_supports_full_repo_name(self) -> None:
@@ -494,7 +533,7 @@ class SearchRepositoriesTests(unittest.TestCase):
         self.assertEqual([item.image for item in results], ["alice/three", "alice/four"])
 
 
-class SaveReportTests(unittest.TestCase):
+class SaveReportTests(BaseStatefulTests):
     def test_save_report_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             report_path = Path(tmp_dir) / "report.json"
@@ -537,7 +576,7 @@ class SaveReportTests(unittest.TestCase):
             self.assertEqual(rows[0]["status"], "ok")
 
 
-class DatabaseTests(unittest.TestCase):
+class DatabaseTests(BaseStatefulTests):
     def test_db_marks_and_filters_processed_images(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             config = AppConfig(Path(tmp_dir) / "state.db", 1, None, [])
@@ -566,7 +605,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertFalse(should_mark_processed(ScanResult("alice/one", 1, None, False, False, "pull_failed")))
 
 
-class ScanRepositoriesTests(unittest.TestCase):
+class ScanRepositoriesTests(BaseStatefulTests):
     @patch("docker_hub_env_finder.scan_repository")
     def test_parallel_scan_preserves_input_order(self, scan_repository_mock) -> None:
         candidates = [
@@ -610,7 +649,31 @@ class ScanRepositoriesTests(unittest.TestCase):
 
         self.assertIn("Processed 1/1: alice/first:1.0.0 [ok]", stderr.getvalue())
 
-class ScanRepositoryTests(unittest.TestCase):
+    @patch("docker_hub_env_finder.scan_repository")
+    def test_sequential_scan_stops_after_disk_full(self, scan_repository_mock) -> None:
+        candidates = [
+            RepositoryCandidate("first", "alice", "image", 1, ""),
+            RepositoryCandidate("second", "bob", "image", 1, ""),
+        ]
+        scan_repository_mock.side_effect = [
+            ScanResult("alice/first", 1, None, False, False, "disk_full", error="no space left on device"),
+            ScanResult("bob/second", 1, None, True, False, "ok"),
+        ]
+
+        results = scan_repositories(
+            candidates,
+            start_timeout=0.1,
+            keep_temp=False,
+            workers=1,
+            result_dir=Path("/tmp/result"),
+            config=TEST_CONFIG,
+            insecure=False,
+        )
+
+        self.assertEqual([item.status for item in results], ["disk_full"])
+        self.assertEqual(scan_repository_mock.call_count, 1)
+
+class ScanRepositoryTests(BaseStatefulTests):
     @patch("docker_hub_env_finder.shutil.rmtree")
     @patch("docker_hub_env_finder.cleanup_image")
     @patch("docker_hub_env_finder.cleanup_container")
@@ -648,14 +711,40 @@ class ScanRepositoryTests(unittest.TestCase):
         )
 
         self.assertEqual(result.image, "jjjohny228/1win4games:32.0.0")
-        self.assertEqual(run_command_mock.call_args_list[0].args[0], ["docker", "create", "--name", unittest.mock.ANY, "jjjohny228/1win4games:32.0.0"])
+        self.assertEqual(
+            run_command_mock.call_args_list[0].args[0],
+            ["docker", "create", "--label", MANAGED_CONTAINER_LABEL, "--name", unittest.mock.ANY, "jjjohny228/1win4games:32.0.0"],
+        )
         self.assertEqual(run_command_mock.call_args_list[1].args[0], ["docker", "inspect", "-f", "{{.Image}}", unittest.mock.ANY])
         cleanup_image_mock.assert_called_once_with("sha256:abc123")
 
 
-class CleanupTests(unittest.TestCase):
-    def setUp(self) -> None:
-        _IMAGE_USAGE_COUNTS.clear()
+class CleanupTests(BaseStatefulTests):
+    @patch("docker_hub_env_finder.send_telegram_message")
+    @patch("docker_hub_env_finder.run_command")
+    def test_cleanup_docker_storage_only_prunes_managed_resources(
+        self,
+        run_command_mock,
+        send_telegram_message_mock,
+    ) -> None:
+        _KNOWN_IMAGE_IDS.add("sha256:owned")
+        run_command_mock.side_effect = [
+            type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
+            type("CP", (), {"returncode": 0, "stderr": "", "stdout": ""})(),
+        ]
+
+        cleanup_ok = cleanup_docker_storage(TEST_CONFIG)
+
+        self.assertTrue(cleanup_ok)
+        self.assertEqual(
+            run_command_mock.call_args_list[0].args[0],
+            ["docker", "container", "prune", "-f", "--filter", f"label={MANAGED_CONTAINER_LABEL}"],
+        )
+        self.assertEqual(
+            run_command_mock.call_args_list[1].args[0],
+            ["docker", "image", "rm", "-f", "sha256:owned"],
+        )
+        send_telegram_message_mock.assert_called_once()
 
     @patch("docker_hub_env_finder.run_command")
     def test_cleanup_image_uses_exact_image_id(self, run_command_mock) -> None:

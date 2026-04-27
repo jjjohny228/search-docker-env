@@ -92,7 +92,7 @@ python3 docker_hub_env_finder.py fastapi --insecure
 
 ```bash
 docker compose build
-docker compose run --rm scanner prod --max-results 150 --workers 1
+docker compose run -d --rm scanner prod --max-results 150 --workers 1 --insecure
 ```
 
 ## Аргументы
