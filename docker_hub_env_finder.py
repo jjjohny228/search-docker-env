@@ -51,6 +51,7 @@ SENSITIVE_FILE_NAMES = {
     "config.yaml",
     "secrets.json",
     "credentials.json",
+    "README.md",
 }
 ENV_EXCLUDED_NAMES = {
     ".env.example",

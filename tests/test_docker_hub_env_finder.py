@@ -82,6 +82,7 @@ class ContainsEnvFileTests(BaseStatefulTests):
             app_dir.mkdir(parents=True)
             (app_dir / ".env.production").write_text("SECRET=1", encoding="utf-8")
             (app_dir / "config.json").write_text('{"token":"1"}', encoding="utf-8")
+            (app_dir / "README.md").write_text("deployment notes", encoding="utf-8")
             (app_dir / ".env.example").write_text("PUBLIC=1", encoding="utf-8")
             (app_dir / "settings.py").write_text("DEBUG=False", encoding="utf-8")
 
@@ -89,7 +90,7 @@ class ContainsEnvFileTests(BaseStatefulTests):
 
             self.assertEqual(
                 [path.name for path in matches],
-                [".env.production", "config.json"],
+                [".env.production", "README.md", "config.json"],
             )
 
     def test_returns_false_when_env_is_missing(self) -> None:

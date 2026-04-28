@@ -174,7 +174,17 @@ TELEGRAM_ADMIN_IDS=
 
 ## Что считается находкой
 
-Сейчас скрипт намеренно не считает находками:
+Сейчас скрипт ищет, например:
+- `.env*` кроме исключений ниже
+- `config.json`
+- `application.yml`
+- `application.yaml`
+- `config.yaml`
+- `secrets.json`
+- `credentials.json`
+- `README.md`
+
+И при этом намеренно не считает находками:
 - `.env.example`
 - `.env.sample`
 - `.env.template`
