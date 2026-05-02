@@ -380,6 +380,21 @@ class SearchRepositoriesTests(BaseStatefulTests):
         self.assertIn("Docker Hub search request failed with HTTP 404", str(ctx.exception))
 
     @patch("docker_hub_env_finder.request.urlopen")
+    def test_fetch_search_page_treats_page_overflow_as_empty_page(self, urlopen_mock) -> None:
+        urlopen_mock.side_effect = HTTPError(
+            url="https://hub.docker.com/v2/search/repositories/?query=ofm&page=3&page_size=100&ordering=-last_updated",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=None,
+        )
+
+        payload = fetch_search_page("ofm", 3, 100)
+
+        self.assertEqual(payload["results"], [])
+        self.assertIsNone(payload["next"])
+
+    @patch("docker_hub_env_finder.request.urlopen")
     def test_fetch_tags_page_raises_clear_error_for_http_404(self, urlopen_mock) -> None:
         urlopen_mock.side_effect = HTTPError(
             url="https://hub.docker.com/v2/namespaces/alice/repositories/app/tags?page_size=25&ordering=last_updated",
@@ -652,17 +667,20 @@ class SearchRepositoriesTests(BaseStatefulTests):
     @patch("docker_hub_env_finder.fetch_search_page")
     def test_search_repositories_starts_from_requested_page(self, fetch_search_page) -> None:
         fetch_search_page.return_value = {"next": "", "results": []}
+        stderr = io.StringIO()
 
-        search_repositories(
-            query="app",
-            max_pulls=500,
-            max_results=2,
-            page_size=100,
-            max_pages=5,
-            start_page=3,
-        )
+        with patch("sys.stderr", new=stderr):
+            search_repositories(
+                query="app",
+                max_pulls=500,
+                max_results=2,
+                page_size=100,
+                max_pages=5,
+                start_page=3,
+            )
 
         self.assertEqual(fetch_search_page.call_args.kwargs["page"], 3)
+        self.assertIn("Fetching Docker Hub search page 3 for query 'app'", stderr.getvalue())
 
     @patch("docker_hub_env_finder.fetch_search_page")
     def test_stops_when_docker_hub_reports_no_next_page(self, fetch_search_page) -> None:
@@ -765,6 +783,23 @@ class SearchRepositoriesTests(BaseStatefulTests):
             )
 
         self.assertEqual([item.image for item in results], ["alice/two", "alice/three"])
+
+    @patch("docker_hub_env_finder.fetch_namespace_repositories_page")
+    def test_list_namespace_repositories_prints_page_progress(self, fetch_namespace_repositories_page_mock) -> None:
+        fetch_namespace_repositories_page_mock.return_value = {"next": "", "results": []}
+        stderr = io.StringIO()
+
+        with patch("sys.stderr", new=stderr):
+            list_namespace_repositories(
+                namespace="alice",
+                max_pulls=500,
+                max_results=10,
+                page_size=100,
+                max_pages=5,
+                start_page=2,
+            )
+
+        self.assertIn("Fetching Docker Hub namespace page 2 for 'alice'", stderr.getvalue())
 
     @patch("docker_hub_env_finder.fetch_search_page")
     def test_collect_unprocessed_candidates_can_ignore_db_for_query_mode(self, fetch_search_page) -> None:

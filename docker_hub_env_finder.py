@@ -273,6 +273,8 @@ def fetch_search_page(query: str, page: int, page_size: int, insecure: bool = Fa
         with request.urlopen(req, timeout=20, context=context) as response:
             return json.load(response)
     except HTTPError as exc:
+        if exc.code == 404 and page > 1:
+            return {"count": 0, "next": None, "previous": None, "results": []}
         raise RuntimeError(f"Docker Hub search request failed with HTTP {exc.code}: {req.full_url}") from exc
 
 
@@ -414,6 +416,7 @@ def search_repositories(
     pages_checked = 0
 
     while len(results) < max_results and has_next_page and pages_checked < max_pages:
+        print(f"Fetching Docker Hub search page {page} for query '{query}'", file=sys.stderr)
         payload = fetch_search_page(query=query, page=page, page_size=page_size, insecure=insecure)
         raw_items = payload.get("results", [])
         if not raw_items:
@@ -463,6 +466,7 @@ def list_namespace_repositories(
     pages_checked = 0
 
     while len(results) < max_results and has_next_page and pages_checked < max_pages:
+        print(f"Fetching Docker Hub namespace page {page} for '{namespace}'", file=sys.stderr)
         payload = fetch_namespace_repositories_page(
             namespace=namespace,
             page=page,
