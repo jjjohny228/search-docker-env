@@ -29,6 +29,8 @@ from docker_hub_env_finder import (
     copy_found_env,
     extract_image_parts,
     fetch_namespace_repositories_page,
+    fetch_search_page,
+    fetch_tags_page,
     find_env_file,
     find_sensitive_files,
     filter_unprocessed_candidates,
@@ -360,7 +362,37 @@ class SearchRepositoriesTests(BaseStatefulTests):
         with self.assertRaises(RuntimeError) as ctx:
             fetch_namespace_repositories_page("missing", 1, 100)
 
-        self.assertIn("namespace 'missing' was not found", str(ctx.exception))
+        self.assertIn("Namespace='missing'", str(ctx.exception))
+
+    @patch("docker_hub_env_finder.request.urlopen")
+    def test_fetch_search_page_raises_clear_error_for_http_404(self, urlopen_mock) -> None:
+        urlopen_mock.side_effect = HTTPError(
+            url="https://hub.docker.com/v2/search/repositories/?query=test&page=1&page_size=100&ordering=-last_updated",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=None,
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_search_page("test", 1, 100)
+
+        self.assertIn("Docker Hub search request failed with HTTP 404", str(ctx.exception))
+
+    @patch("docker_hub_env_finder.request.urlopen")
+    def test_fetch_tags_page_raises_clear_error_for_http_404(self, urlopen_mock) -> None:
+        urlopen_mock.side_effect = HTTPError(
+            url="https://hub.docker.com/v2/namespaces/alice/repositories/app/tags?page_size=25&ordering=last_updated",
+            code=404,
+            msg="Not Found",
+            hdrs=None,
+            fp=None,
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_tags_page("alice", "app")
+
+        self.assertIn("Docker Hub tags request failed with HTTP 404", str(ctx.exception))
 
     @patch("docker_hub_env_finder.request.urlopen")
     def test_fetch_namespace_repositories_page_treats_page_overflow_as_empty_page(self, urlopen_mock) -> None:

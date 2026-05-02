@@ -51,7 +51,7 @@ SENSITIVE_FILE_NAMES = {
     "config.yaml",
     "secrets.json",
     "credentials.json",
-    "README.md",
+    "readme.md",
 }
 ENV_EXCLUDED_NAMES = {
     ".env.example",
@@ -269,8 +269,11 @@ def fetch_search_page(query: str, page: int, page_size: int, insecure: bool = Fa
         },
     )
     context = ssl._create_unverified_context() if insecure else None
-    with request.urlopen(req, timeout=20, context=context) as response:
-        return json.load(response)
+    try:
+        with request.urlopen(req, timeout=20, context=context) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        raise RuntimeError(f"Docker Hub search request failed with HTTP {exc.code}: {req.full_url}") from exc
 
 
 def fetch_tags_page(namespace: str, name: str, page_size: int = 25, insecure: bool = False) -> dict[str, Any]:
@@ -288,8 +291,11 @@ def fetch_tags_page(namespace: str, name: str, page_size: int = 25, insecure: bo
         },
     )
     context = ssl._create_unverified_context() if insecure else None
-    with request.urlopen(req, timeout=20, context=context) as response:
-        return json.load(response)
+    try:
+        with request.urlopen(req, timeout=20, context=context) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        raise RuntimeError(f"Docker Hub tags request failed with HTTP {exc.code}: {req.full_url}") from exc
 
 
 def fetch_namespace_repositories_page(
@@ -330,7 +336,8 @@ def fetch_namespace_repositories_page(
             return {"count": 0, "next": None, "previous": None, "results": []}
         if exc.code == 404:
             raise RuntimeError(
-                f"Docker Hub namespace '{namespace}' was not found or has no public repositories."
+                "Docker Hub namespace repository list request failed. "
+                f"Namespace='{namespace}', primary='{primary_url}', legacy='{legacy_url}'."
             ) from exc
         raise
 
