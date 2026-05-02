@@ -44,6 +44,8 @@ _KNOWN_IMAGE_IDS: set[str] = set()
 _DB_LOCK = threading.Lock()
 _PROXY_STATE_LOCK = threading.Lock()
 _DOCKER_CLEANUP_LOCK = threading.Lock()
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+TELEGRAM_RETRY_LIMIT = 5
 SENSITIVE_FILE_NAMES = {
     "config.json",
     "application.yml",
@@ -910,6 +912,22 @@ def send_telegram_form_request(
         return False, str(exc)
 
 
+def parse_telegram_retry_after(error: str | None) -> int | None:
+    if not error:
+        return None
+    match = re.search(r'"retry_after"\s*:\s*(\d+)', error)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def truncate_telegram_message(text: str, limit: int = TELEGRAM_MAX_MESSAGE_LENGTH) -> str:
+    if len(text) <= limit:
+        return text
+    suffix = "\n...[truncated]"
+    return text[: max(limit - len(suffix), 0)] + suffix
+
+
 def build_multipart_body(
     fields: dict[str, str],
     files: list[tuple[str, Path, str | None]],
@@ -976,14 +994,25 @@ def send_telegram_message(config: AppConfig, text: str) -> None:
     if not config.telegram_bot_token or not config.telegram_admin_ids:
         return
 
+    text = truncate_telegram_message(text)
     for admin_id in config.telegram_admin_ids:
-        ok, error = send_telegram_form_request(
-            config,
-            "sendMessage",
-            {"chat_id": admin_id, "text": text},
-        )
-        if not ok and error:
-            print(f"Telegram sendMessage failed for chat {admin_id}: {error}", file=sys.stderr)
+        for attempt in range(TELEGRAM_RETRY_LIMIT):
+            ok, error = send_telegram_form_request(
+                config,
+                "sendMessage",
+                {"chat_id": admin_id, "text": text},
+            )
+            if ok:
+                break
+
+            retry_after = parse_telegram_retry_after(error)
+            if retry_after is not None and attempt < TELEGRAM_RETRY_LIMIT - 1:
+                time.sleep(retry_after)
+                continue
+
+            if error:
+                print(f"Telegram sendMessage failed for chat {admin_id}: {error}", file=sys.stderr)
+            break
 
 
 def chunk_paths(paths: list[Path], chunk_size: int) -> list[list[Path]]:
@@ -1061,17 +1090,27 @@ def send_telegram_file_groups(config: AppConfig, image: str, saved_files: list[P
                 media.append(media_item)
                 multipart_files.append((attachment_name, file_path, None))
 
-            ok, error = send_telegram_multipart_request(
-                config,
-                "sendMediaGroup",
-                {
-                    "chat_id": admin_id,
-                    "media": json.dumps(media, ensure_ascii=False),
-                },
-                multipart_files,
-            )
-            if not ok and error:
-                print(f"Telegram sendMediaGroup failed for chat {admin_id}: {error}", file=sys.stderr)
+            for attempt in range(TELEGRAM_RETRY_LIMIT):
+                ok, error = send_telegram_multipart_request(
+                    config,
+                    "sendMediaGroup",
+                    {
+                        "chat_id": admin_id,
+                        "media": json.dumps(media, ensure_ascii=False),
+                    },
+                    multipart_files,
+                )
+                if ok:
+                    break
+
+                retry_after = parse_telegram_retry_after(error)
+                if retry_after is not None and attempt < TELEGRAM_RETRY_LIMIT - 1:
+                    time.sleep(retry_after)
+                    continue
+
+                if error:
+                    print(f"Telegram sendMediaGroup failed for chat {admin_id}: {error}", file=sys.stderr)
+                break
 
 
 def pause_on_rate_limit(config: AppConfig, image_reference: str) -> None:

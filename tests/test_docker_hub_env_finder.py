@@ -40,6 +40,7 @@ from docker_hub_env_finder import (
     mark_image_processed,
     make_safe_image_name,
     pause_on_rate_limit,
+    parse_telegram_retry_after,
     probe_namespace_endpoint,
     probe_namespace_endpoints,
     rotate_proxy,
@@ -47,6 +48,7 @@ from docker_hub_env_finder import (
     scan_repository,
     scan_repositories,
     send_telegram_file_groups,
+    send_telegram_message,
     list_namespace_repositories,
     search_repositories,
     slice_candidates,
@@ -191,6 +193,10 @@ class ResultFileTests(BaseStatefulTests):
         self.assertEqual(len(chunks[0]), 10)
         self.assertEqual(len(chunks[1]), 2)
 
+    def test_parse_telegram_retry_after(self) -> None:
+        error = 'HTTP 429: {"ok":false,"parameters":{"retry_after":13}}'
+        self.assertEqual(parse_telegram_retry_after(error), 13)
+
     def test_validate_socks5_proxy(self) -> None:
         self.assertEqual(validate_socks5_proxy("socks5://127.0.0.1:1080"), "socks5://127.0.0.1:1080")
         self.assertEqual(validate_socks5_proxy("socks5h://user:pass@127.0.0.1:1080"), "socks5h://user:pass@127.0.0.1:1080")
@@ -239,6 +245,38 @@ class ResultFileTests(BaseStatefulTests):
             send_telegram_file_groups(config, "alice/project:1", files)
 
         self.assertEqual(send_telegram_multipart_request_mock.call_count, 1)
+
+    @patch("docker_hub_env_finder.time.sleep")
+    @patch("docker_hub_env_finder.send_telegram_multipart_request")
+    def test_send_telegram_file_groups_retries_on_rate_limit(
+        self,
+        send_telegram_multipart_request_mock,
+        sleep_mock,
+    ) -> None:
+        send_telegram_multipart_request_mock.side_effect = [
+            (False, 'HTTP 429: {"ok":false,"parameters":{"retry_after":3}}'),
+            (True, None),
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            file_path = root / ".env"
+            file_path.write_text("KEY=VALUE", encoding="utf-8")
+
+            config = AppConfig(Path("state.db"), 1, "token", ["1"])
+            send_telegram_file_groups(config, "alice/project:1", [file_path])
+
+        sleep_mock.assert_called_once_with(3)
+        self.assertEqual(send_telegram_multipart_request_mock.call_count, 2)
+
+    @patch("docker_hub_env_finder.send_telegram_form_request")
+    def test_send_telegram_message_truncates_long_text(self, send_telegram_form_request_mock) -> None:
+        send_telegram_form_request_mock.return_value = (True, None)
+        config = AppConfig(Path("state.db"), 1, "token", ["1"])
+
+        send_telegram_message(config, "x" * 5000)
+
+        sent_text = send_telegram_form_request_mock.call_args.args[2]["text"]
+        self.assertLessEqual(len(sent_text), 4096)
 
     def test_build_r2_key(self) -> None:
         config = AppConfig(
