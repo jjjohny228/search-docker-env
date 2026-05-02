@@ -46,6 +46,7 @@ _PROXY_STATE_LOCK = threading.Lock()
 _DOCKER_CLEANUP_LOCK = threading.Lock()
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 TELEGRAM_RETRY_LIMIT = 5
+MAX_README_MATCHES_PER_IMAGE = 4
 SENSITIVE_FILE_NAMES = {
     "config.json",
     "application.yml",
@@ -721,10 +722,17 @@ def find_env_file(directory: Path) -> Path | None:
 
 def find_sensitive_files(directory: Path) -> list[Path]:
     matches: list[Path] = []
+    readme_matches: list[Path] = []
     for path in directory.rglob("*"):
-        if path.is_file() and is_sensitive_file(path):
-            matches.append(path)
-    return sorted(matches)
+        if not path.is_file() or not is_sensitive_file(path):
+            continue
+        if path.name.lower() == "readme.md":
+            readme_matches.append(path)
+            continue
+        matches.append(path)
+
+    limited_readmes = sorted(readme_matches)[:MAX_README_MATCHES_PER_IMAGE]
+    return sorted(matches) + limited_readmes
 
 
 def contains_env_file(directory: Path) -> bool:

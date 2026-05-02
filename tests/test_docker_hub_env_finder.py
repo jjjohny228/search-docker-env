@@ -94,8 +94,21 @@ class ContainsEnvFileTests(BaseStatefulTests):
 
             self.assertEqual(
                 [path.name for path in matches],
-                [".env.production", "README.md", "config.json"],
+                [".env.production", "config.json", "README.md"],
             )
+
+    def test_limits_readme_matches_to_four(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            for index in range(6):
+                readme_dir = root / f"service_{index}"
+                readme_dir.mkdir(parents=True)
+                (readme_dir / "README.md").write_text(f"notes {index}", encoding="utf-8")
+
+            matches = find_sensitive_files(root)
+
+            self.assertEqual(len(matches), 4)
+            self.assertTrue(all(path.name == "README.md" for path in matches))
 
     def test_returns_false_when_env_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
