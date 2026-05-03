@@ -20,6 +20,27 @@ from pathlib import Path
 from typing import Any
 from urllib import parse, request
 from urllib.error import HTTPError, URLError
+from telegram_control_bot import (
+    BUTTON_CANCEL,
+    BUTTON_FINISH,
+    BUTTON_START,
+    TEXT_ACCESS_DENIED,
+    TEXT_CHOOSE_ACTION,
+    TEXT_NO_ACTIVE_SCAN,
+    TEXT_SEND_QUERY,
+    TEXT_START_CANCELLED,
+    TEXT_USE_START,
+    already_running_text,
+    awaiting_query_keyboard,
+    command_definitions,
+    failed_scan_text,
+    finished_scan_text,
+    idle_keyboard,
+    running_keyboard,
+    started_scan_text,
+    stopped_scan_text,
+    stopping_scan_text,
+)
 
 try:
     import boto3
@@ -108,6 +129,20 @@ class ScanResult:
     error: str | None = None
 
 
+@dataclass(slots=True)
+class BotControlSession:
+    state: str = "idle"
+    pending_query: str | None = None
+
+
+@dataclass(slots=True)
+class ActiveScanState:
+    query: str
+    chat_id: str
+    stop_event: threading.Event
+    thread: threading.Thread
+
+
 def load_config() -> AppConfig:
     load_dotenv()
 
@@ -165,7 +200,7 @@ def parse_args() -> argparse.Namespace:
             "copy the full container filesystem into a temporary directory and check whether it contains a .env file."
         )
     )
-    target_group = parser.add_mutually_exclusive_group(required=True)
+    target_group = parser.add_mutually_exclusive_group(required=False)
     target_group.add_argument("query", nargs="?", help="Search query for Docker Hub.")
     target_group.add_argument(
         "--user-images",
@@ -252,7 +287,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable TLS certificate verification for Docker Hub requests.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--bot-control",
+        action="store_true",
+        help="Run a Telegram control bot that starts scans after receiving a search query.",
+    )
+    parser.add_argument(
+        "--bot-poll-interval",
+        type=float,
+        default=1.0,
+        help="Seconds to wait between Telegram polling iterations when idle. Default: 1.0.",
+    )
+    args = parser.parse_args()
+    if not args.bot_control and not (args.query or args.user_images or args.probe_user_endpoints):
+        parser.error("Provide a search query, --user-images, --probe-user-endpoints, or enable --bot-control.")
+    return args
 
 
 def fetch_search_page(query: str, page: int, page_size: int, insecure: bool = False) -> dict[str, Any]:
@@ -527,6 +576,7 @@ def collect_unprocessed_candidates(
     start_from_image: str | None,
     ignore_db: bool,
     insecure: bool,
+    stop_event: threading.Event | None = None,
 ) -> list[RepositoryCandidate]:
     collected: list[RepositoryCandidate] = []
     seen_images: set[str] = set()
@@ -536,6 +586,8 @@ def collect_unprocessed_candidates(
     apply_initial_offset = True
 
     while len(collected) < max_results and pages_checked < max_pages:
+        if stop_event and stop_event.is_set():
+            break
         if user_images:
             page_candidates = list_namespace_repositories(
                 namespace=user_images,
@@ -998,29 +1050,40 @@ def send_telegram_multipart_request(
         return False, str(exc)
 
 
+def send_telegram_chat_message(
+    config: AppConfig,
+    chat_id: str,
+    text: str,
+    reply_markup: str | None = None,
+) -> bool:
+    text = truncate_telegram_message(text)
+    fields = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        fields["reply_markup"] = reply_markup
+
+    for attempt in range(TELEGRAM_RETRY_LIMIT):
+        ok, error = send_telegram_form_request(config, "sendMessage", fields)
+        if ok:
+            return True
+
+        retry_after = parse_telegram_retry_after(error)
+        if retry_after is not None and attempt < TELEGRAM_RETRY_LIMIT - 1:
+            time.sleep(retry_after)
+            continue
+
+        if error:
+            print(f"Telegram sendMessage failed for chat {chat_id}: {error}", file=sys.stderr)
+        return False
+
+    return False
+
+
 def send_telegram_message(config: AppConfig, text: str) -> None:
     if not config.telegram_bot_token or not config.telegram_admin_ids:
         return
 
-    text = truncate_telegram_message(text)
     for admin_id in config.telegram_admin_ids:
-        for attempt in range(TELEGRAM_RETRY_LIMIT):
-            ok, error = send_telegram_form_request(
-                config,
-                "sendMessage",
-                {"chat_id": admin_id, "text": text},
-            )
-            if ok:
-                break
-
-            retry_after = parse_telegram_retry_after(error)
-            if retry_after is not None and attempt < TELEGRAM_RETRY_LIMIT - 1:
-                time.sleep(retry_after)
-                continue
-
-            if error:
-                print(f"Telegram sendMessage failed for chat {admin_id}: {error}", file=sys.stderr)
-            break
+        send_telegram_chat_message(config, admin_id, text)
 
 
 def chunk_paths(paths: list[Path], chunk_size: int) -> list[list[Path]]:
@@ -1121,12 +1184,69 @@ def send_telegram_file_groups(config: AppConfig, image: str, saved_files: list[P
                 break
 
 
-def pause_on_rate_limit(config: AppConfig, image_reference: str) -> None:
+def fetch_telegram_updates(
+    config: AppConfig,
+    offset: int | None = None,
+    timeout: int = 20,
+) -> list[dict[str, Any]]:
+    if not config.telegram_bot_token:
+        return []
+
+    params: dict[str, Any] = {"timeout": timeout}
+    if offset is not None:
+        params["offset"] = offset
+    query = parse.urlencode(params)
+    api_url = f"https://api.telegram.org/bot{config.telegram_bot_token}/getUpdates?{query}"
+    context = ssl._create_unverified_context() if config.insecure_network else None
+    req = request.Request(api_url, headers={"Accept": "application/json"})
+    with request.urlopen(req, timeout=timeout + 10, context=context) as response:
+        payload = json.load(response)
+    return payload.get("result", [])
+
+
+def register_telegram_commands(config: AppConfig) -> bool:
+    if not config.telegram_bot_token:
+        return False
+    return send_telegram_form_request(
+        config,
+        "setMyCommands",
+        {"commands": json.dumps(command_definitions(), ensure_ascii=False)},
+    )[0]
+
+
+def is_authorized_admin(config: AppConfig, chat_id: str) -> bool:
+    return not config.telegram_admin_ids or chat_id in config.telegram_admin_ids
+
+
+def get_message_text(update: dict[str, Any]) -> tuple[str | None, str | None]:
+    message = update.get("message") or update.get("edited_message") or {}
+    text = message.get("text")
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return None, None
+    return str(chat_id), text.strip() if isinstance(text, str) else None
+
+
+def wait_with_stop(timeout_seconds: float, stop_event: threading.Event | None = None) -> bool:
+    if timeout_seconds <= 0:
+        return False
+    if stop_event:
+        return stop_event.wait(timeout_seconds)
+    time.sleep(timeout_seconds)
+    return False
+
+
+def pause_on_rate_limit(
+    config: AppConfig,
+    image_reference: str,
+    stop_event: threading.Event | None = None,
+) -> bool:
     wait_text = format_wait_duration(config.rate_limit_wait_hours)
     message = f"Pull rate limit reached for {image_reference}. Application paused for {wait_text}."
     print(message, file=sys.stderr)
     send_telegram_message(config, message)
-    time.sleep(max(config.rate_limit_wait_hours, 0) * 3600)
+    return wait_with_stop(max(config.rate_limit_wait_hours, 0) * 3600, stop_event=stop_event)
 
 
 def cleanup_docker_storage(config: AppConfig) -> bool:
@@ -1170,7 +1290,11 @@ def has_active_image_usage() -> bool:
         return any(count > 0 for count in _IMAGE_USAGE_COUNTS.values())
 
 
-def handle_rate_limit(config: AppConfig, image_reference: str) -> None:
+def handle_rate_limit(
+    config: AppConfig,
+    image_reference: str,
+    stop_event: threading.Event | None = None,
+) -> bool:
     active_proxy = get_active_proxy(config)
     next_proxy, wrapped = rotate_proxy(config)
 
@@ -1180,34 +1304,40 @@ def handle_rate_limit(config: AppConfig, image_reference: str) -> None:
             f"from {active_proxy or 'direct'} to {next_proxy}.",
             file=sys.stderr,
         )
-        return
+        return False
 
     if next_proxy and wrapped:
         print(
             f"All proxies exhausted for {image_reference}. Returning to first proxy {next_proxy}.",
             file=sys.stderr,
         )
-    pause_on_rate_limit(config, image_reference)
+    return pause_on_rate_limit(config, image_reference, stop_event=stop_event)
 
 
 def choose_pullable_image_reference(
     candidate: RepositoryCandidate,
     config: AppConfig,
     insecure: bool = False,
+    stop_event: threading.Event | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     last_error: str | None = None
     last_status: str | None = None
 
     for image_reference in get_image_references(candidate, insecure=insecure):
+        if stop_event and stop_event.is_set():
+            return None, "stopped", "scan cancelled before pull"
         disk_cleanup_attempts = 0
         while True:
+            if stop_event and stop_event.is_set():
+                return None, "stopped", "scan cancelled during pull"
             pull_result = run_command(["docker", "pull", image_reference], check=False)
             error_text = pull_result.stderr.strip() or pull_result.stdout.strip() or "docker pull failed"
             if pull_result.returncode == 0:
                 return image_reference, None, None
 
             if is_rate_limit_error(error_text):
-                handle_rate_limit(config, image_reference)
+                if handle_rate_limit(config, image_reference, stop_event=stop_event):
+                    return None, "stopped", "scan cancelled while waiting for rate limit"
                 continue
 
             if is_disk_full_error(error_text):
@@ -1221,7 +1351,8 @@ def choose_pullable_image_reference(
                             f"before retrying pull for {image_reference}.",
                             file=sys.stderr,
                         )
-                        time.sleep(2.0)
+                        if wait_with_stop(2.0, stop_event=stop_event):
+                            return None, "stopped", "scan cancelled during docker cleanup wait"
                     print(f"Retrying pull for {image_reference} after docker storage cleanup.", file=sys.stderr)
                     continue
                 return None, "disk_full", error_text
@@ -1274,6 +1405,7 @@ def scan_repository(
     result_dir: Path,
     config: AppConfig,
     insecure: bool,
+    stop_event: threading.Event | None = None,
 ) -> ScanResult:
     container_name = f"find-docker-env-{uuid.uuid4().hex[:12]}"
     temp_dir_path = Path(tempfile.mkdtemp(prefix=f"find-docker-env-{make_safe_image_name(candidate.image)}-"))
@@ -1281,11 +1413,22 @@ def scan_repository(
     resolved_image_id: str | None = None
 
     try:
+        if stop_event and stop_event.is_set():
+            return ScanResult(
+                image=candidate.image,
+                pull_count=candidate.pull_count,
+                temp_dir=temp_dir_path if keep_temp else None,
+                files_copied=False,
+                env_found=False,
+                status="stopped",
+                error="scan cancelled before pull",
+            )
         try:
             resolved_image, pull_status, pull_error = choose_pullable_image_reference(
                 candidate,
                 config=config,
                 insecure=insecure,
+                stop_event=stop_event,
             )
         except (HTTPError, URLError, TimeoutError, RuntimeError) as exc:
             return ScanResult(
@@ -1309,6 +1452,16 @@ def scan_repository(
                 error=pull_error,
             )
 
+        if stop_event and stop_event.is_set():
+            return ScanResult(
+                image=resolved_image,
+                pull_count=candidate.pull_count,
+                temp_dir=temp_dir_path if keep_temp else None,
+                files_copied=False,
+                env_found=False,
+                status="stopped",
+                error="scan cancelled before container create",
+            )
         create_result = run_command(
             ["docker", "create", "--label", MANAGED_CONTAINER_LABEL, "--name", container_name, resolved_image],
             check=False,
@@ -1329,6 +1482,16 @@ def scan_repository(
         if resolved_image_id:
             register_image_usage(resolved_image_id)
 
+        if stop_event and stop_event.is_set():
+            return ScanResult(
+                image=resolved_image,
+                pull_count=candidate.pull_count,
+                temp_dir=temp_dir_path if keep_temp else None,
+                files_copied=False,
+                env_found=False,
+                status="stopped",
+                error="scan cancelled before container start",
+            )
         start_result = run_command(["docker", "start", container_name], check=False)
         if start_result.returncode != 0:
             error = start_result.stderr.strip() or start_result.stdout.strip() or "docker start failed"
@@ -1342,8 +1505,21 @@ def scan_repository(
                 error=error,
             )
 
-        time.sleep(start_timeout)
+        if stop_event:
+            stop_event.wait(start_timeout)
+        else:
+            time.sleep(start_timeout)
         run_command(["docker", "stop", "-t", "5", container_name], check=False)
+        if stop_event and stop_event.is_set():
+            return ScanResult(
+                image=resolved_image,
+                pull_count=candidate.pull_count,
+                temp_dir=temp_dir_path if keep_temp else None,
+                files_copied=False,
+                env_found=False,
+                status="stopped",
+                error="scan cancelled after container stop",
+            )
 
         files_copied, copied_root, copy_error = copy_container_filesystem(container_name, temp_dir_path)
         matched_files = find_sensitive_files(copied_root) if files_copied and copied_root is not None else []
@@ -1462,6 +1638,247 @@ def print_text_results(results: list[ScanResult]) -> None:
         print("-" * 60)
 
 
+def execute_scan(
+    args: argparse.Namespace,
+    config: AppConfig,
+    query_override: str | None = None,
+    stop_event: threading.Event | None = None,
+) -> tuple[int, list[ScanResult] | None]:
+    try:
+        ensure_docker_available()
+        init_db(config)
+        start_page = calculate_start_page(args.start_from_index, args.page_size)
+        candidates = collect_unprocessed_candidates(
+            config=config,
+            query=query_override if query_override is not None else args.query,
+            user_images=args.user_images,
+            max_pulls=args.max_pulls,
+            max_results=args.max_results,
+            page_size=args.page_size,
+            max_pages=args.max_pages,
+            start_page=start_page,
+            start_from_index=args.start_from_index,
+            start_from_image=args.start_from_image,
+            ignore_db=args.ignore_db,
+            insecure=args.insecure,
+            stop_event=stop_event,
+        )
+    except ssl.SSLCertVerificationError as exc:
+        print(
+            "TLS certificate verification failed while talking to Docker Hub. "
+            "Retry with --insecure if you trust this network/environment.\n"
+            f"Details: {exc}",
+            file=sys.stderr,
+        )
+        return 1, None
+    except URLError as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            print(
+                "TLS certificate verification failed while talking to Docker Hub. "
+                "Retry with --insecure if you trust this network/environment.\n"
+                f"Details: {reason}",
+                file=sys.stderr,
+            )
+            return 1, None
+        print(f"Network error while talking to Docker Hub: {exc}", file=sys.stderr)
+        return 1, None
+    except (HTTPError, TimeoutError) as exc:
+        print(f"Network error while talking to Docker Hub: {exc}", file=sys.stderr)
+        return 1, None
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1, None
+
+    results = scan_repositories(
+        candidates=candidates,
+        start_timeout=args.start_timeout,
+        keep_temp=args.keep_temp,
+        workers=max(args.workers, 1),
+        result_dir=Path(args.result_dir),
+        config=config,
+        ignore_db=args.ignore_db,
+        insecure=args.insecure,
+        stop_event=stop_event,
+    )
+    return 0, results
+
+
+def run_scan_in_background(
+    args: argparse.Namespace,
+    config: AppConfig,
+    query: str,
+    chat_id: str,
+    active_scan_ref: dict[str, ActiveScanState | None],
+    active_scan_lock: threading.Lock,
+) -> ActiveScanState:
+    stop_event = threading.Event()
+
+    def worker() -> None:
+        try:
+            exit_code, results = execute_scan(args, config, query_override=query, stop_event=stop_event)
+            if stop_event.is_set():
+                send_telegram_chat_message(
+                    config,
+                    chat_id,
+                    stopped_scan_text(query),
+                    reply_markup=idle_keyboard(),
+                )
+                return
+
+            if exit_code != 0 or results is None:
+                send_telegram_chat_message(
+                    config,
+                    chat_id,
+                    failed_scan_text(query),
+                    reply_markup=idle_keyboard(),
+                )
+                return
+
+            matches_count = sum(1 for item in results if item.env_found)
+            send_telegram_chat_message(
+                config,
+                chat_id,
+                finished_scan_text(query, len(results), matches_count),
+                reply_markup=idle_keyboard(),
+            )
+        finally:
+            with active_scan_lock:
+                active_scan_ref["scan"] = None
+
+    thread = threading.Thread(target=worker, name="telegram-control-scan", daemon=True)
+    scan_state = ActiveScanState(query=query, chat_id=chat_id, stop_event=stop_event, thread=thread)
+    with active_scan_lock:
+        active_scan_ref["scan"] = scan_state
+    thread.start()
+    return scan_state
+
+
+def run_telegram_control_bot(args: argparse.Namespace, config: AppConfig) -> int:
+    if not config.telegram_bot_token:
+        print("TELEGRAM_BOT_TOKEN is required for --bot-control.", file=sys.stderr)
+        return 1
+
+    sessions: dict[str, BotControlSession] = {}
+    active_scan_ref: dict[str, ActiveScanState | None] = {"scan": None}
+    active_scan_lock = threading.Lock()
+    offset: int | None = None
+
+    if not register_telegram_commands(config):
+        print("Telegram command registration failed.", file=sys.stderr)
+    print("Telegram control bot started.", file=sys.stderr)
+
+    while True:
+        try:
+            updates = fetch_telegram_updates(config, offset=offset, timeout=20)
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            print(f"Telegram polling failed: {exc}", file=sys.stderr)
+            time.sleep(max(args.bot_poll_interval, 0.5))
+            continue
+
+        if not updates:
+            time.sleep(max(args.bot_poll_interval, 0.0))
+            continue
+
+        for update in updates:
+            offset = int(update.get("update_id", 0)) + 1
+            chat_id, text = get_message_text(update)
+            if not chat_id or not text:
+                continue
+            if not is_authorized_admin(config, chat_id):
+                send_telegram_chat_message(config, chat_id, TEXT_ACCESS_DENIED)
+                continue
+
+            session = sessions.setdefault(chat_id, BotControlSession())
+            active_scan = active_scan_ref["scan"]
+            normalized = text.strip()
+
+            if normalized == "/start":
+                session.state = "idle"
+                session.pending_query = None
+                keyboard = running_keyboard() if active_scan else idle_keyboard()
+                send_telegram_chat_message(config, chat_id, TEXT_CHOOSE_ACTION, reply_markup=keyboard)
+                continue
+
+            if normalized == "/finish":
+                normalized = BUTTON_FINISH
+
+            if normalized == BUTTON_CANCEL:
+                session.state = "idle"
+                session.pending_query = None
+                keyboard = running_keyboard() if active_scan else idle_keyboard()
+                send_telegram_chat_message(config, chat_id, TEXT_START_CANCELLED, reply_markup=keyboard)
+                continue
+
+            if normalized == BUTTON_FINISH:
+                if not active_scan:
+                    send_telegram_chat_message(
+                        config,
+                        chat_id,
+                        TEXT_NO_ACTIVE_SCAN,
+                        reply_markup=idle_keyboard(),
+                    )
+                    continue
+
+                active_scan.stop_event.set()
+                send_telegram_chat_message(
+                    config,
+                    chat_id,
+                    stopping_scan_text(active_scan.query),
+                    reply_markup=idle_keyboard(),
+                )
+                continue
+
+            if normalized == BUTTON_START:
+                if active_scan:
+                    send_telegram_chat_message(
+                        config,
+                        chat_id,
+                        already_running_text(active_scan.query),
+                        reply_markup=running_keyboard(),
+                    )
+                    continue
+
+                session.state = "awaiting_query"
+                session.pending_query = None
+                send_telegram_chat_message(
+                    config,
+                    chat_id,
+                    TEXT_SEND_QUERY,
+                    reply_markup=awaiting_query_keyboard(),
+                )
+                continue
+
+            if session.state == "awaiting_query":
+                query = normalized
+                session.pending_query = query
+                session.state = "idle"
+                scan_state = run_scan_in_background(
+                    args=args,
+                    config=config,
+                    query=query,
+                    chat_id=chat_id,
+                    active_scan_ref=active_scan_ref,
+                    active_scan_lock=active_scan_lock,
+                )
+                send_telegram_chat_message(
+                    config,
+                    chat_id,
+                    started_scan_text(query),
+                    reply_markup=running_keyboard(),
+                )
+                send_telegram_message(config, f"Telegram control started scan for '{scan_state.query}'.")
+                continue
+
+            keyboard = running_keyboard() if active_scan else idle_keyboard()
+            send_telegram_chat_message(
+                config,
+                chat_id,
+                TEXT_USE_START,
+                reply_markup=keyboard,
+            )
+
+
 def scan_repositories(
     candidates: list[RepositoryCandidate],
     start_timeout: float,
@@ -1471,11 +1888,14 @@ def scan_repositories(
     config: AppConfig,
     ignore_db: bool,
     insecure: bool,
+    stop_event: threading.Event | None = None,
 ) -> list[ScanResult]:
     total = len(candidates)
     if workers <= 1:
         results: list[ScanResult] = []
         for index, item in enumerate(candidates, start=1):
+            if stop_event and stop_event.is_set():
+                break
             result = scan_repository(
                 item,
                 start_timeout=start_timeout,
@@ -1483,6 +1903,7 @@ def scan_repositories(
                 result_dir=result_dir,
                 config=config,
                 insecure=insecure,
+                stop_event=stop_event,
             )
             results.append(result)
             if not ignore_db and should_mark_processed(result):
@@ -1494,7 +1915,16 @@ def scan_repositories(
     candidate_by_index = {index: candidate for index, candidate in enumerate(candidates)}
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {
-            executor.submit(scan_repository, candidate, start_timeout, keep_temp, result_dir, config, insecure): index
+            executor.submit(
+                scan_repository,
+                candidate,
+                start_timeout,
+                keep_temp,
+                result_dir,
+                config,
+                insecure,
+                stop_event,
+            ): index
             for index, candidate in enumerate(candidates)
         }
         processed = 0
@@ -1523,6 +1953,9 @@ def main() -> int:
     config = load_config()
     config.insecure_network = args.insecure
 
+    if args.bot_control:
+        return run_telegram_control_bot(args, config)
+
     if args.probe_user_endpoints:
         try:
             results = probe_namespace_endpoints(
@@ -1545,61 +1978,9 @@ def main() -> int:
         print_namespace_probe_results(results)
         return 0
 
-    try:
-        ensure_docker_available()
-        init_db(config)
-        start_page = calculate_start_page(args.start_from_index, args.page_size)
-        candidates = collect_unprocessed_candidates(
-            config=config,
-            query=args.query,
-            user_images=args.user_images,
-            max_pulls=args.max_pulls,
-            max_results=args.max_results,
-            page_size=args.page_size,
-            max_pages=args.max_pages,
-            start_page=start_page,
-            start_from_index=args.start_from_index,
-            start_from_image=args.start_from_image,
-            ignore_db=args.ignore_db,
-            insecure=args.insecure,
-        )
-    except ssl.SSLCertVerificationError as exc:
-        print(
-            "TLS certificate verification failed while talking to Docker Hub. "
-            "Retry with --insecure if you trust this network/environment.\n"
-            f"Details: {exc}",
-            file=sys.stderr,
-        )
-        return 1
-    except URLError as exc:
-        reason = getattr(exc, "reason", None)
-        if isinstance(reason, ssl.SSLCertVerificationError):
-            print(
-                "TLS certificate verification failed while talking to Docker Hub. "
-                "Retry with --insecure if you trust this network/environment.\n"
-                f"Details: {reason}",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"Network error while talking to Docker Hub: {exc}", file=sys.stderr)
-        return 1
-    except (HTTPError, TimeoutError) as exc:
-        print(f"Network error while talking to Docker Hub: {exc}", file=sys.stderr)
-        return 1
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    results = scan_repositories(
-        candidates=candidates,
-        start_timeout=args.start_timeout,
-        keep_temp=args.keep_temp,
-        workers=max(args.workers, 1),
-        result_dir=Path(args.result_dir),
-        config=config,
-        ignore_db=args.ignore_db,
-        insecure=args.insecure,
-    )
+    exit_code, results = execute_scan(args, config)
+    if exit_code != 0 or results is None:
+        return exit_code
 
     send_telegram_message(
         config,

@@ -105,7 +105,7 @@ python3 docker_hub_env_finder.py fastapi --insecure
 
 ```bash
 docker compose build
-docker compose run -d --rm scanner ofm --max-results 500 --workers 1 --insecure
+docker compose run -d --rm scanner polymarket --max-results 500 --workers 1 --insecure
 ```
 
 ## Аргументы

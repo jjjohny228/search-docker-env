@@ -3,6 +3,7 @@ import io
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -33,9 +34,11 @@ from docker_hub_env_finder import (
     fetch_tags_page,
     find_env_file,
     find_sensitive_files,
+    get_message_text,
     filter_unprocessed_candidates,
     get_image_references,
     init_db,
+    is_authorized_admin,
     is_image_processed,
     mark_image_processed,
     make_safe_image_name,
@@ -55,8 +58,10 @@ from docker_hub_env_finder import (
     sync_proxy_state,
     upload_files_to_r2,
     validate_socks5_proxy,
+    wait_with_stop,
     should_mark_processed,
 )
+from telegram_control_bot import awaiting_query_keyboard, idle_keyboard, running_keyboard
 
 
 TEST_CONFIG = AppConfig(Path("state.db"), 1, None, [])
@@ -209,6 +214,26 @@ class ResultFileTests(BaseStatefulTests):
     def test_parse_telegram_retry_after(self) -> None:
         error = 'HTTP 429: {"ok":false,"parameters":{"retry_after":13}}'
         self.assertEqual(parse_telegram_retry_after(error), 13)
+
+    def test_telegram_keyboards_include_expected_buttons(self) -> None:
+        self.assertIn("Start", idle_keyboard())
+        self.assertIn("Cancel", awaiting_query_keyboard())
+        self.assertIn("Finish", running_keyboard())
+
+    def test_get_message_text_extracts_chat_id_and_text(self) -> None:
+        update = {"message": {"chat": {"id": 123}, "text": " hello "}}
+        self.assertEqual(get_message_text(update), ("123", "hello"))
+
+    def test_is_authorized_admin_accepts_known_chat(self) -> None:
+        config = AppConfig(Path("state.db"), 1, "token", ["123"])
+        self.assertTrue(is_authorized_admin(config, "123"))
+        self.assertFalse(is_authorized_admin(config, "456"))
+
+    def test_wait_with_stop_returns_true_when_event_is_set(self) -> None:
+        stop_event = unittest.mock.Mock()
+        stop_event.wait.return_value = True
+        self.assertTrue(wait_with_stop(1.0, stop_event=stop_event))
+        stop_event.wait.assert_called_once_with(1.0)
 
     def test_validate_socks5_proxy(self) -> None:
         self.assertEqual(validate_socks5_proxy("socks5://127.0.0.1:1080"), "socks5://127.0.0.1:1080")
@@ -1096,6 +1121,24 @@ class ScanRepositoryTests(BaseStatefulTests):
         )
         self.assertEqual(run_command_mock.call_args_list[1].args[0], ["docker", "inspect", "-f", "{{.Image}}", unittest.mock.ANY])
         cleanup_image_mock.assert_called_once_with("sha256:abc123")
+
+    def test_scan_repository_stops_before_pull_when_event_is_set(self) -> None:
+        candidate = RepositoryCandidate("project", "alice", "image", 1, "")
+        stop_event = threading.Event()
+        stop_event.set()
+
+        result = scan_repository(
+            candidate,
+            start_timeout=0.0,
+            keep_temp=False,
+            result_dir=Path("/tmp/result"),
+            config=TEST_CONFIG,
+            insecure=False,
+            stop_event=stop_event,
+        )
+
+        self.assertEqual(result.status, "stopped")
+        self.assertFalse(result.env_found)
 
 
 class CleanupTests(BaseStatefulTests):
