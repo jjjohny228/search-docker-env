@@ -70,6 +70,7 @@ from telegram_control_bot import (
     finished_scan_text,
     idle_keyboard,
     mode_keyboard,
+    scope_keyboard,
     running_keyboard,
 )
 
@@ -230,6 +231,8 @@ class ResultFileTests(BaseStatefulTests):
         self.assertIn("Cancel", awaiting_query_keyboard())
         self.assertIn("Search", mode_keyboard())
         self.assertIn("User Images", mode_keyboard())
+        self.assertIn("Skip Processed", scope_keyboard())
+        self.assertIn("Scan All", scope_keyboard())
         self.assertIn("Finish", running_keyboard())
 
     def test_user_images_text_is_descriptive(self) -> None:
@@ -281,6 +284,41 @@ class ResultFileTests(BaseStatefulTests):
         self.assertEqual(collect_unprocessed_candidates_mock.call_args.kwargs["query"], None)
         self.assertEqual(collect_unprocessed_candidates_mock.call_args.kwargs["user_images"], "openai")
         scan_repositories_mock.assert_called_once()
+
+    @patch("docker_hub_env_finder.scan_repositories", return_value=[])
+    @patch("docker_hub_env_finder.collect_unprocessed_candidates", return_value=[])
+    @patch("docker_hub_env_finder.init_db")
+    @patch("docker_hub_env_finder.ensure_docker_available")
+    def test_execute_scan_passes_ignore_db_override(
+        self,
+        ensure_docker_available_mock,
+        init_db_mock,
+        collect_unprocessed_candidates_mock,
+        scan_repositories_mock,
+    ) -> None:
+        args = Namespace(
+            query="fastapi",
+            user_images=None,
+            max_pulls=500,
+            max_results=10,
+            page_size=100,
+            max_pages=20,
+            start_from_index=1,
+            start_from_image=None,
+            ignore_db=False,
+            insecure=False,
+            start_timeout=1.0,
+            keep_temp=False,
+            workers=1,
+            result_dir="result",
+        )
+
+        exit_code, results = execute_scan(args, TEST_CONFIG, ignore_db_override=True)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(results, [])
+        self.assertTrue(collect_unprocessed_candidates_mock.call_args.kwargs["ignore_db"])
+        self.assertTrue(scan_repositories_mock.call_args.kwargs["ignore_db"])
 
     def test_wait_with_stop_returns_true_when_event_is_set(self) -> None:
         stop_event = unittest.mock.Mock()

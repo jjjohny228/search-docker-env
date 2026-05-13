@@ -138,8 +138,10 @@ docker rm -f finddockerenv-bot
 
 Сценарий работы в Telegram:
 - отправь боту `/start`
+- бот покажет кнопку `Start`
 - нажми `Start`
-- выбери режим `Search` или `User Images`
+- выбери действие `Search` или `User Images`
+- выбери режим обработки: `Skip Processed` или `Scan All`
 - для `Search` отправь поисковый запрос для Docker Hub
 - для `User Images` отправь имя Docker Hub пользователя или namespace
 - после запуска используй кнопку `Finish` или команду `/finish`, чтобы остановить текущий скан

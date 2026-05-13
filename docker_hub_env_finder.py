@@ -25,12 +25,15 @@ from telegram_control_bot import (
     BUTTON_FINISH,
     BUTTON_MODE_SEARCH,
     BUTTON_MODE_USER_IMAGES,
+    BUTTON_SCOPE_SCAN_ALL,
+    BUTTON_SCOPE_SKIP_PROCESSED,
     BUTTON_START,
     SCAN_MODE_QUERY,
     SCAN_MODE_USER_IMAGES,
     TEXT_ACCESS_DENIED,
     TEXT_CHOOSE_ACTION,
     TEXT_CHOOSE_MODE,
+    TEXT_CHOOSE_SCOPE,
     TEXT_NO_ACTIVE_SCAN,
     TEXT_SEND_QUERY,
     TEXT_SEND_USER_IMAGES,
@@ -44,6 +47,7 @@ from telegram_control_bot import (
     finished_scan_text,
     idle_keyboard,
     mode_keyboard,
+    scope_keyboard,
     running_keyboard,
     started_scan_text,
     stopped_scan_text,
@@ -142,12 +146,14 @@ class BotControlSession:
     state: str = "idle"
     pending_query: str | None = None
     pending_mode: str = SCAN_MODE_QUERY
+    pending_ignore_db: bool = False
 
 
 @dataclass(slots=True)
 class ActiveScanState:
     target: str
     mode: str
+    ignore_db: bool
     chat_id: str
     stop_event: threading.Event
     thread: threading.Thread
@@ -1653,6 +1659,7 @@ def execute_scan(
     config: AppConfig,
     query_override: str | None = None,
     user_images_override: str | None = None,
+    ignore_db_override: bool | None = None,
     stop_event: threading.Event | None = None,
 ) -> tuple[int, list[ScanResult] | None]:
     try:
@@ -1661,6 +1668,7 @@ def execute_scan(
         start_page = calculate_start_page(args.start_from_index, args.page_size)
         query = query_override if query_override is not None else args.query
         user_images = user_images_override if user_images_override is not None else args.user_images
+        ignore_db = ignore_db_override if ignore_db_override is not None else args.ignore_db
         candidates = collect_unprocessed_candidates(
             config=config,
             query=query,
@@ -1672,7 +1680,7 @@ def execute_scan(
             start_page=start_page,
             start_from_index=args.start_from_index,
             start_from_image=args.start_from_image,
-            ignore_db=args.ignore_db,
+            ignore_db=ignore_db,
             insecure=args.insecure,
             stop_event=stop_event,
         )
@@ -1710,7 +1718,7 @@ def execute_scan(
         workers=max(args.workers, 1),
         result_dir=Path(args.result_dir),
         config=config,
-        ignore_db=args.ignore_db,
+        ignore_db=ignore_db,
         insecure=args.insecure,
         stop_event=stop_event,
     )
@@ -1722,6 +1730,7 @@ def run_scan_in_background(
     config: AppConfig,
     target: str,
     mode: str,
+    ignore_db: bool,
     chat_id: str,
     active_scan_ref: dict[str, ActiveScanState | None],
     active_scan_lock: threading.Lock,
@@ -1736,6 +1745,7 @@ def run_scan_in_background(
                 config,
                 query_override=target if mode == SCAN_MODE_QUERY else None,
                 user_images_override=target if mode == SCAN_MODE_USER_IMAGES else None,
+                ignore_db_override=ignore_db,
                 stop_event=stop_event,
             )
             if stop_event.is_set():
@@ -1768,7 +1778,14 @@ def run_scan_in_background(
                 active_scan_ref["scan"] = None
 
     thread = threading.Thread(target=worker, name="telegram-control-scan", daemon=True)
-    scan_state = ActiveScanState(target=target, mode=mode, chat_id=chat_id, stop_event=stop_event, thread=thread)
+    scan_state = ActiveScanState(
+        target=target,
+        mode=mode,
+        ignore_db=ignore_db,
+        chat_id=chat_id,
+        stop_event=stop_event,
+        thread=thread,
+    )
     with active_scan_lock:
         active_scan_ref["scan"] = scan_state
     thread.start()
@@ -1819,8 +1836,9 @@ def run_telegram_control_bot(args: argparse.Namespace, config: AppConfig) -> int
                 session.state = "idle"
                 session.pending_query = None
                 session.pending_mode = SCAN_MODE_QUERY
+                session.pending_ignore_db = False
                 keyboard = running_keyboard() if active_scan else idle_keyboard()
-                send_telegram_chat_message(config, chat_id, TEXT_CHOOSE_ACTION, reply_markup=keyboard)
+                send_telegram_chat_message(config, chat_id, TEXT_USE_START, reply_markup=keyboard)
                 continue
 
             if normalized == "/finish":
@@ -1830,6 +1848,7 @@ def run_telegram_control_bot(args: argparse.Namespace, config: AppConfig) -> int
                 session.state = "idle"
                 session.pending_query = None
                 session.pending_mode = SCAN_MODE_QUERY
+                session.pending_ignore_db = False
                 keyboard = running_keyboard() if active_scan else idle_keyboard()
                 send_telegram_chat_message(config, chat_id, TEXT_START_CANCELLED, reply_markup=keyboard)
                 continue
@@ -1866,22 +1885,36 @@ def run_telegram_control_bot(args: argparse.Namespace, config: AppConfig) -> int
                 session.state = "awaiting_mode"
                 session.pending_query = None
                 session.pending_mode = SCAN_MODE_QUERY
+                session.pending_ignore_db = False
                 send_telegram_chat_message(
                     config,
                     chat_id,
-                    TEXT_CHOOSE_MODE,
+                    TEXT_CHOOSE_ACTION,
                     reply_markup=mode_keyboard(),
                 )
                 continue
 
             if session.state == "awaiting_mode" and normalized in {BUTTON_MODE_SEARCH, BUTTON_MODE_USER_IMAGES}:
                 if normalized == BUTTON_MODE_USER_IMAGES:
-                    session.state = "awaiting_user_images"
                     session.pending_mode = SCAN_MODE_USER_IMAGES
+                else:
+                    session.pending_mode = SCAN_MODE_QUERY
+                session.state = "awaiting_scope"
+                send_telegram_chat_message(
+                    config,
+                    chat_id,
+                    TEXT_CHOOSE_SCOPE,
+                    reply_markup=scope_keyboard(),
+                )
+                continue
+
+            if session.state == "awaiting_scope" and normalized in {BUTTON_SCOPE_SKIP_PROCESSED, BUTTON_SCOPE_SCAN_ALL}:
+                session.pending_ignore_db = normalized == BUTTON_SCOPE_SCAN_ALL
+                if session.pending_mode == SCAN_MODE_USER_IMAGES:
+                    session.state = "awaiting_user_images"
                     prompt_text = TEXT_SEND_USER_IMAGES
                 else:
                     session.state = "awaiting_query"
-                    session.pending_mode = SCAN_MODE_QUERY
                     prompt_text = TEXT_SEND_QUERY
                 send_telegram_chat_message(
                     config,
@@ -1894,6 +1927,7 @@ def run_telegram_control_bot(args: argparse.Namespace, config: AppConfig) -> int
             if session.state in {"awaiting_query", "awaiting_user_images"}:
                 target = normalized
                 mode = session.pending_mode
+                ignore_db = session.pending_ignore_db
                 session.pending_query = target
                 session.state = "idle"
                 scan_state = run_scan_in_background(
@@ -1901,6 +1935,7 @@ def run_telegram_control_bot(args: argparse.Namespace, config: AppConfig) -> int
                     config=config,
                     target=target,
                     mode=mode,
+                    ignore_db=ignore_db,
                     chat_id=chat_id,
                     active_scan_ref=active_scan_ref,
                     active_scan_lock=active_scan_lock,
@@ -1913,7 +1948,9 @@ def run_telegram_control_bot(args: argparse.Namespace, config: AppConfig) -> int
                 )
                 send_telegram_message(
                     config,
-                    f"Telegram control started scan for {describe_scan_target(scan_state.target, scan_state.mode)}.",
+                    "Telegram control started scan for "
+                    f"{describe_scan_target(scan_state.target, scan_state.mode)} "
+                    f"with {'--ignore-db' if scan_state.ignore_db else 'processed image skipping enabled'}.",
                 )
                 continue
 

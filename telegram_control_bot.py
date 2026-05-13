@@ -6,6 +6,8 @@ BUTTON_FINISH = "Finish"
 BUTTON_CANCEL = "Cancel"
 BUTTON_MODE_SEARCH = "Search"
 BUTTON_MODE_USER_IMAGES = "User Images"
+BUTTON_SCOPE_SKIP_PROCESSED = "Skip Processed"
+BUTTON_SCOPE_SCAN_ALL = "Scan All"
 
 COMMAND_START = "start"
 COMMAND_FINISH = "finish"
@@ -14,7 +16,8 @@ SCAN_MODE_QUERY = "query"
 SCAN_MODE_USER_IMAGES = "user_images"
 
 TEXT_CHOOSE_ACTION = "Choose an action."
-TEXT_CHOOSE_MODE = "Choose scan mode."
+TEXT_CHOOSE_MODE = "Choose an action."
+TEXT_CHOOSE_SCOPE = "Choose how to handle previously processed images."
 TEXT_ACCESS_DENIED = "Access denied."
 TEXT_NO_ACTIVE_SCAN = "There is no active scan."
 TEXT_SEND_QUERY = "Send the Docker Hub search query."
@@ -28,6 +31,7 @@ def reply_keyboard(*rows: list[str]) -> str:
         "keyboard": [[{"text": button} for button in row] for row in rows],
         "resize_keyboard": True,
         "one_time_keyboard": False,
+        "is_persistent": True,
     }
     return json.dumps(keyboard, ensure_ascii=False)
 
@@ -42,6 +46,10 @@ def awaiting_query_keyboard() -> str:
 
 def mode_keyboard() -> str:
     return reply_keyboard([BUTTON_MODE_SEARCH, BUTTON_MODE_USER_IMAGES], [BUTTON_CANCEL])
+
+
+def scope_keyboard() -> str:
+    return reply_keyboard([BUTTON_SCOPE_SKIP_PROCESSED, BUTTON_SCOPE_SCAN_ALL], [BUTTON_CANCEL])
 
 
 def running_keyboard() -> str:
