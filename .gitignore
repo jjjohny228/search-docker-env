@@ -24,3 +24,6 @@ proxies.txt
 proxy_state.json
 r2_downloads/
 в обработку/
+.claude/
+good-2/
+results.json

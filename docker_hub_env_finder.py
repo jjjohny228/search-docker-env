@@ -23,19 +23,27 @@ from urllib.error import HTTPError, URLError
 from telegram_control_bot import (
     BUTTON_CANCEL,
     BUTTON_FINISH,
+    BUTTON_MODE_SEARCH,
+    BUTTON_MODE_USER_IMAGES,
     BUTTON_START,
+    SCAN_MODE_QUERY,
+    SCAN_MODE_USER_IMAGES,
     TEXT_ACCESS_DENIED,
     TEXT_CHOOSE_ACTION,
+    TEXT_CHOOSE_MODE,
     TEXT_NO_ACTIVE_SCAN,
     TEXT_SEND_QUERY,
+    TEXT_SEND_USER_IMAGES,
     TEXT_START_CANCELLED,
     TEXT_USE_START,
     already_running_text,
     awaiting_query_keyboard,
     command_definitions,
+    describe_scan_target,
     failed_scan_text,
     finished_scan_text,
     idle_keyboard,
+    mode_keyboard,
     running_keyboard,
     started_scan_text,
     stopped_scan_text,
@@ -133,11 +141,13 @@ class ScanResult:
 class BotControlSession:
     state: str = "idle"
     pending_query: str | None = None
+    pending_mode: str = SCAN_MODE_QUERY
 
 
 @dataclass(slots=True)
 class ActiveScanState:
-    query: str
+    target: str
+    mode: str
     chat_id: str
     stop_event: threading.Event
     thread: threading.Thread
@@ -1642,16 +1652,19 @@ def execute_scan(
     args: argparse.Namespace,
     config: AppConfig,
     query_override: str | None = None,
+    user_images_override: str | None = None,
     stop_event: threading.Event | None = None,
 ) -> tuple[int, list[ScanResult] | None]:
     try:
         ensure_docker_available()
         init_db(config)
         start_page = calculate_start_page(args.start_from_index, args.page_size)
+        query = query_override if query_override is not None else args.query
+        user_images = user_images_override if user_images_override is not None else args.user_images
         candidates = collect_unprocessed_candidates(
             config=config,
-            query=query_override if query_override is not None else args.query,
-            user_images=args.user_images,
+            query=query,
+            user_images=user_images,
             max_pulls=args.max_pulls,
             max_results=args.max_results,
             page_size=args.page_size,
@@ -1707,21 +1720,29 @@ def execute_scan(
 def run_scan_in_background(
     args: argparse.Namespace,
     config: AppConfig,
-    query: str,
+    target: str,
+    mode: str,
     chat_id: str,
     active_scan_ref: dict[str, ActiveScanState | None],
     active_scan_lock: threading.Lock,
 ) -> ActiveScanState:
     stop_event = threading.Event()
+    scan_label = describe_scan_target(target, mode)
 
     def worker() -> None:
         try:
-            exit_code, results = execute_scan(args, config, query_override=query, stop_event=stop_event)
+            exit_code, results = execute_scan(
+                args,
+                config,
+                query_override=target if mode == SCAN_MODE_QUERY else None,
+                user_images_override=target if mode == SCAN_MODE_USER_IMAGES else None,
+                stop_event=stop_event,
+            )
             if stop_event.is_set():
                 send_telegram_chat_message(
                     config,
                     chat_id,
-                    stopped_scan_text(query),
+                    stopped_scan_text(target, mode),
                     reply_markup=idle_keyboard(),
                 )
                 return
@@ -1730,7 +1751,7 @@ def run_scan_in_background(
                 send_telegram_chat_message(
                     config,
                     chat_id,
-                    failed_scan_text(query),
+                    failed_scan_text(target, mode),
                     reply_markup=idle_keyboard(),
                 )
                 return
@@ -1739,7 +1760,7 @@ def run_scan_in_background(
             send_telegram_chat_message(
                 config,
                 chat_id,
-                finished_scan_text(query, len(results), matches_count),
+                finished_scan_text(target, len(results), matches_count, mode),
                 reply_markup=idle_keyboard(),
             )
         finally:
@@ -1747,10 +1768,11 @@ def run_scan_in_background(
                 active_scan_ref["scan"] = None
 
     thread = threading.Thread(target=worker, name="telegram-control-scan", daemon=True)
-    scan_state = ActiveScanState(query=query, chat_id=chat_id, stop_event=stop_event, thread=thread)
+    scan_state = ActiveScanState(target=target, mode=mode, chat_id=chat_id, stop_event=stop_event, thread=thread)
     with active_scan_lock:
         active_scan_ref["scan"] = scan_state
     thread.start()
+    print(f"Started Telegram background scan for {scan_label}.", file=sys.stderr)
     return scan_state
 
 
@@ -1796,6 +1818,7 @@ def run_telegram_control_bot(args: argparse.Namespace, config: AppConfig) -> int
             if normalized == "/start":
                 session.state = "idle"
                 session.pending_query = None
+                session.pending_mode = SCAN_MODE_QUERY
                 keyboard = running_keyboard() if active_scan else idle_keyboard()
                 send_telegram_chat_message(config, chat_id, TEXT_CHOOSE_ACTION, reply_markup=keyboard)
                 continue
@@ -1806,6 +1829,7 @@ def run_telegram_control_bot(args: argparse.Namespace, config: AppConfig) -> int
             if normalized == BUTTON_CANCEL:
                 session.state = "idle"
                 session.pending_query = None
+                session.pending_mode = SCAN_MODE_QUERY
                 keyboard = running_keyboard() if active_scan else idle_keyboard()
                 send_telegram_chat_message(config, chat_id, TEXT_START_CANCELLED, reply_markup=keyboard)
                 continue
@@ -1824,7 +1848,7 @@ def run_telegram_control_bot(args: argparse.Namespace, config: AppConfig) -> int
                 send_telegram_chat_message(
                     config,
                     chat_id,
-                    stopping_scan_text(active_scan.query),
+                    stopping_scan_text(active_scan.target, active_scan.mode),
                     reply_markup=idle_keyboard(),
                 )
                 continue
@@ -1834,29 +1858,49 @@ def run_telegram_control_bot(args: argparse.Namespace, config: AppConfig) -> int
                     send_telegram_chat_message(
                         config,
                         chat_id,
-                        already_running_text(active_scan.query),
+                        already_running_text(active_scan.target, active_scan.mode),
                         reply_markup=running_keyboard(),
                     )
                     continue
 
-                session.state = "awaiting_query"
+                session.state = "awaiting_mode"
                 session.pending_query = None
+                session.pending_mode = SCAN_MODE_QUERY
                 send_telegram_chat_message(
                     config,
                     chat_id,
-                    TEXT_SEND_QUERY,
+                    TEXT_CHOOSE_MODE,
+                    reply_markup=mode_keyboard(),
+                )
+                continue
+
+            if session.state == "awaiting_mode" and normalized in {BUTTON_MODE_SEARCH, BUTTON_MODE_USER_IMAGES}:
+                if normalized == BUTTON_MODE_USER_IMAGES:
+                    session.state = "awaiting_user_images"
+                    session.pending_mode = SCAN_MODE_USER_IMAGES
+                    prompt_text = TEXT_SEND_USER_IMAGES
+                else:
+                    session.state = "awaiting_query"
+                    session.pending_mode = SCAN_MODE_QUERY
+                    prompt_text = TEXT_SEND_QUERY
+                send_telegram_chat_message(
+                    config,
+                    chat_id,
+                    prompt_text,
                     reply_markup=awaiting_query_keyboard(),
                 )
                 continue
 
-            if session.state == "awaiting_query":
-                query = normalized
-                session.pending_query = query
+            if session.state in {"awaiting_query", "awaiting_user_images"}:
+                target = normalized
+                mode = session.pending_mode
+                session.pending_query = target
                 session.state = "idle"
                 scan_state = run_scan_in_background(
                     args=args,
                     config=config,
-                    query=query,
+                    target=target,
+                    mode=mode,
                     chat_id=chat_id,
                     active_scan_ref=active_scan_ref,
                     active_scan_lock=active_scan_lock,
@@ -1864,10 +1908,13 @@ def run_telegram_control_bot(args: argparse.Namespace, config: AppConfig) -> int
                 send_telegram_chat_message(
                     config,
                     chat_id,
-                    started_scan_text(query),
+                    started_scan_text(target, mode),
                     reply_markup=running_keyboard(),
                 )
-                send_telegram_message(config, f"Telegram control started scan for '{scan_state.query}'.")
+                send_telegram_message(
+                    config,
+                    f"Telegram control started scan for {describe_scan_target(scan_state.target, scan_state.mode)}.",
+                )
                 continue
 
             keyboard = running_keyboard() if active_scan else idle_keyboard()

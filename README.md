@@ -108,6 +108,48 @@ docker compose build
 docker compose run -d --rm scanner polymarket --max-results 500 --workers 1 --insecure
 ```
 
+### Запуск через Telegram-бота
+
+Чтобы управлять сканированием через Telegram, сначала заполни в `.env`:
+
+```env
+TELEGRAM_BOT_TOKEN=123456:ABCDEF...
+TELEGRAM_ADMIN_IDS=123456789
+```
+
+Затем подними сервисы Docker daemon и proxy bridge:
+
+```bash
+docker compose up -d docker proxy-bridge
+```
+
+После этого запусти scanner в режиме bot control:
+
+```bash
+docker compose run -d --name finddockerenv-bot scanner --bot-control
+```
+
+Полезные команды:
+
+```bash
+docker logs -f finddockerenv-bot
+docker rm -f finddockerenv-bot
+```
+
+Сценарий работы в Telegram:
+- отправь боту `/start`
+- нажми `Start`
+- выбери режим `Search` или `User Images`
+- для `Search` отправь поисковый запрос для Docker Hub
+- для `User Images` отправь имя Docker Hub пользователя или namespace
+- после запуска используй кнопку `Finish` или команду `/finish`, чтобы остановить текущий скан
+
+Если нужен одноразовый запуск в текущем терминале без фонового контейнера:
+
+```bash
+docker compose run --rm scanner --bot-control
+```
+
 ## Аргументы
 
 - `query` — поисковое слово для Docker Hub.

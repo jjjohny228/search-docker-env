@@ -4,14 +4,21 @@ import json
 BUTTON_START = "Start"
 BUTTON_FINISH = "Finish"
 BUTTON_CANCEL = "Cancel"
+BUTTON_MODE_SEARCH = "Search"
+BUTTON_MODE_USER_IMAGES = "User Images"
 
 COMMAND_START = "start"
 COMMAND_FINISH = "finish"
 
+SCAN_MODE_QUERY = "query"
+SCAN_MODE_USER_IMAGES = "user_images"
+
 TEXT_CHOOSE_ACTION = "Choose an action."
+TEXT_CHOOSE_MODE = "Choose scan mode."
 TEXT_ACCESS_DENIED = "Access denied."
 TEXT_NO_ACTIVE_SCAN = "There is no active scan."
 TEXT_SEND_QUERY = "Send the Docker Hub search query."
+TEXT_SEND_USER_IMAGES = "Send the Docker Hub user or namespace."
 TEXT_USE_START = "Use Start to launch a scan."
 TEXT_START_CANCELLED = "Start cancelled."
 
@@ -33,6 +40,10 @@ def awaiting_query_keyboard() -> str:
     return reply_keyboard([BUTTON_CANCEL])
 
 
+def mode_keyboard() -> str:
+    return reply_keyboard([BUTTON_MODE_SEARCH, BUTTON_MODE_USER_IMAGES], [BUTTON_CANCEL])
+
+
 def running_keyboard() -> str:
     return reply_keyboard([BUTTON_FINISH])
 
@@ -44,25 +55,34 @@ def command_definitions() -> list[dict[str, str]]:
     ]
 
 
-def started_scan_text(query: str) -> str:
-    return f"Started scan for '{query}'."
+def describe_scan_target(target: str, mode: str = SCAN_MODE_QUERY) -> str:
+    if mode == SCAN_MODE_USER_IMAGES:
+        return f"user images '{target}'"
+    return f"search '{target}'"
 
 
-def stopping_scan_text(query: str) -> str:
-    return f"Stopping scan for '{query}'."
+def started_scan_text(target: str, mode: str = SCAN_MODE_QUERY) -> str:
+    return f"Started scan for {describe_scan_target(target, mode)}."
 
 
-def already_running_text(query: str) -> str:
-    return f"Scan for '{query}' is already running."
+def stopping_scan_text(target: str, mode: str = SCAN_MODE_QUERY) -> str:
+    return f"Stopping scan for {describe_scan_target(target, mode)}."
 
 
-def stopped_scan_text(query: str) -> str:
-    return f"Scan for '{query}' stopped."
+def already_running_text(target: str, mode: str = SCAN_MODE_QUERY) -> str:
+    return f"Scan for {describe_scan_target(target, mode)} is already running."
 
 
-def failed_scan_text(query: str) -> str:
-    return f"Scan for '{query}' failed."
+def stopped_scan_text(target: str, mode: str = SCAN_MODE_QUERY) -> str:
+    return f"Scan for {describe_scan_target(target, mode)} stopped."
 
 
-def finished_scan_text(query: str, processed: int, matches: int) -> str:
-    return f"Scan for '{query}' finished. Processed {processed} images, found matches in {matches}."
+def failed_scan_text(target: str, mode: str = SCAN_MODE_QUERY) -> str:
+    return f"Scan for {describe_scan_target(target, mode)} failed."
+
+
+def finished_scan_text(target: str, processed: int, matches: int, mode: str = SCAN_MODE_QUERY) -> str:
+    return (
+        f"Scan for {describe_scan_target(target, mode)} finished. "
+        f"Processed {processed} images, found matches in {matches}."
+    )

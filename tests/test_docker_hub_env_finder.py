@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -28,6 +29,7 @@ from docker_hub_env_finder import (
     cleanup_image,
     contains_env_file,
     copy_found_env,
+    execute_scan,
     extract_image_parts,
     fetch_namespace_repositories_page,
     fetch_search_page,
@@ -61,7 +63,15 @@ from docker_hub_env_finder import (
     wait_with_stop,
     should_mark_processed,
 )
-from telegram_control_bot import awaiting_query_keyboard, idle_keyboard, running_keyboard
+from telegram_control_bot import (
+    SCAN_MODE_USER_IMAGES,
+    awaiting_query_keyboard,
+    describe_scan_target,
+    finished_scan_text,
+    idle_keyboard,
+    mode_keyboard,
+    running_keyboard,
+)
 
 
 TEST_CONFIG = AppConfig(Path("state.db"), 1, None, [])
@@ -218,7 +228,13 @@ class ResultFileTests(BaseStatefulTests):
     def test_telegram_keyboards_include_expected_buttons(self) -> None:
         self.assertIn("Start", idle_keyboard())
         self.assertIn("Cancel", awaiting_query_keyboard())
+        self.assertIn("Search", mode_keyboard())
+        self.assertIn("User Images", mode_keyboard())
         self.assertIn("Finish", running_keyboard())
+
+    def test_user_images_text_is_descriptive(self) -> None:
+        self.assertEqual(describe_scan_target("openai", SCAN_MODE_USER_IMAGES), "user images 'openai'")
+        self.assertIn("Processed 3 images", finished_scan_text("openai", 3, 1, SCAN_MODE_USER_IMAGES))
 
     def test_get_message_text_extracts_chat_id_and_text(self) -> None:
         update = {"message": {"chat": {"id": 123}, "text": " hello "}}
@@ -228,6 +244,43 @@ class ResultFileTests(BaseStatefulTests):
         config = AppConfig(Path("state.db"), 1, "token", ["123"])
         self.assertTrue(is_authorized_admin(config, "123"))
         self.assertFalse(is_authorized_admin(config, "456"))
+
+    @patch("docker_hub_env_finder.scan_repositories", return_value=[])
+    @patch("docker_hub_env_finder.collect_unprocessed_candidates", return_value=[])
+    @patch("docker_hub_env_finder.init_db")
+    @patch("docker_hub_env_finder.ensure_docker_available")
+    def test_execute_scan_passes_user_images_override(
+        self,
+        ensure_docker_available_mock,
+        init_db_mock,
+        collect_unprocessed_candidates_mock,
+        scan_repositories_mock,
+    ) -> None:
+        args = Namespace(
+            query=None,
+            user_images=None,
+            max_pulls=500,
+            max_results=10,
+            page_size=100,
+            max_pages=20,
+            start_from_index=1,
+            start_from_image=None,
+            ignore_db=False,
+            insecure=False,
+            start_timeout=1.0,
+            keep_temp=False,
+            workers=1,
+            result_dir="result",
+        )
+
+        exit_code, results = execute_scan(args, TEST_CONFIG, user_images_override="openai")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(results, [])
+        collect_unprocessed_candidates_mock.assert_called_once()
+        self.assertEqual(collect_unprocessed_candidates_mock.call_args.kwargs["query"], None)
+        self.assertEqual(collect_unprocessed_candidates_mock.call_args.kwargs["user_images"], "openai")
+        scan_repositories_mock.assert_called_once()
 
     def test_wait_with_stop_returns_true_when_event_is_set(self) -> None:
         stop_event = unittest.mock.Mock()
